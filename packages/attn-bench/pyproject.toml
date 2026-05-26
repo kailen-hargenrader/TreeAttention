@@ -1,0 +1,29 @@
+[project]
+name = "attn-bench"
+version = "0.1.0"
+description = "Benchmark harness for attention CUDA kernels on A100, with FlashAttention-2 as the baseline."
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "torch==2.7.1",
+    "pyyaml>=6",
+    "rich>=13",
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+treeattn-torch = ["treeattn-torch"]
+treeattn-jax = ["treeattn-jax"]
+treeattn = ["treeattn-torch", "treeattn-jax"]
+
+[tool.uv.sources]
+treeattn-torch = { workspace = true }
+treeattn-jax = { workspace = true }
+
+[project.scripts]
+attn-bench = "attn_bench.run:main"
+attn-bench-plot = "attn_bench.plot_seqlen:main"
+
+[build-system]
+requires = ["uv_build>=0.11.15,<0.12.0"]
+build-backend = "uv_build"

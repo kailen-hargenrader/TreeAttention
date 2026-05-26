@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# uv / venv
+.venv/
+
+# Build artifacts
+build/
+dist/
+
+# Harness outputs
+results/
+
+# Editor
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,42 @@
+# Virtual workspace root for the TreeAttention repo.
+#
+# This file defines the uv workspace and shared resolver settings (cu126
+# torch index, flash-attn wheel URL, dev/fa2 dependency groups). It ships
+# no code of its own; the real packages live under `packages/`:
+#
+#   packages/attn-bench/      — benchmark harness (CLI: attn-bench)
+#   packages/treeattn-torch/  — pure-PyTorch hierarchical attention kernel
+#   packages/treeattn-jax/    — JAX-backed kernel with a torch.autograd bridge
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+fa2 = [
+    "flash-attn",
+]
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
+# Force a single nvidia-cudnn-cu12 version across the env. torch 2.7.1+cu126
+# pins ==9.5.1.17; jax[cuda12]>=0.6 declares >=9.8. Both wheels are abi-
+# compatible with the newer cudnn library, so we override torch's pin up to
+# satisfy jax. (Without this override the two cannot coexist.)
+override-dependencies = [
+    "nvidia-cudnn-cu12>=9.8",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["packages/attn-bench/tests"]
