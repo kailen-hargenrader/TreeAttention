@@ -172,21 +172,34 @@ def _make_sweep(args: argparse.Namespace) -> list[BenchConfig]:
 
 def _series_from_results(
     results: list[Result], label: str, adapter_name: str,
-) -> tuple[list[int], list[float], list[float]]:
-    """Return (seqlens, fwd_median_ms, bwd_median_ms) for one kernel,
-    keeping only ``status=="ok"`` cells. Missing bwd is NaN.
+) -> tuple[list[int], list[float], list[float], list[float], list[float], list[float]]:
+    """Return (seqlens, fwd_ms, bwd_ms, fwd_peak_mb, fwd_resid_mb, bwd_peak_mb)
+    for one kernel, keeping only ``status=="ok"`` cells.
     """
     seqs: list[int] = []
     fwds: list[float] = []
     bwds: list[float] = []
+    fwd_peaks: list[float] = []
+    fwd_resids: list[float] = []
+    bwd_peaks: list[float] = []
     for r in results:
         if r.kernel != adapter_name or r.status != "ok":
             continue
         seqs.append(r.config.seqlen)
         fwds.append(r.fwd.median_ms if r.fwd else float("nan"))
         bwds.append(r.bwd.median_ms if r.bwd else float("nan"))
+        fwd_peaks.append(r.fwd_peak_mem_mb)
+        fwd_resids.append(r.fwd_residual_mem_mb)
+        bwd_peaks.append(r.bwd_peak_mem_mb)
     order = sorted(range(len(seqs)), key=lambda i: seqs[i])
-    return [seqs[i] for i in order], [fwds[i] for i in order], [bwds[i] for i in order]
+    return (
+        [seqs[i] for i in order],
+        [fwds[i] for i in order],
+        [bwds[i] for i in order],
+        [fwd_peaks[i] for i in order],
+        [fwd_resids[i] for i in order],
+        [bwd_peaks[i] for i in order],
+    )
 
 
 def _plot(
@@ -204,37 +217,57 @@ def _plot(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    n_panels = 2 if do_backward else 1
-    fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 5), squeeze=False)
-    ax_fwd = axes[0, 0]
-    ax_bwd = axes[0, 1] if do_backward else None
+    # Panels: fwd time, [bwd time], fwd peak mem, fwd residual mem, [bwd peak mem]
+    panels: list[tuple[str, str, int]] = [("Forward time", "ms", 1)]
+    if do_backward:
+        panels.append(("Backward time", "ms", 2))
+    panels.append(("Forward peak memory", "MiB", 3))
+    panels.append(("Forward residual memory", "MiB", 4))
+    if do_backward:
+        panels.append(("Backward peak memory", "MiB", 5))
+
+    n = len(panels)
+    ncols = min(n, 3)
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4.5 * nrows), squeeze=False)
+    axes_flat = [axes[r][c] for r in range(nrows) for c in range(ncols)]
+    for ax in axes_flat[n:]:
+        ax.set_visible(False)
 
     cmap = plt.get_cmap("tab10")
     for i, (label, adapter) in enumerate(labeled):
         color = cmap(i % 10)
-        seqs, fwds, bwds = _series_from_results(results, label, adapter.name)
+        seqs, fwds, bwds, fwd_peaks, fwd_resids, bwd_peaks = _series_from_results(
+            results, label, adapter.name,
+        )
         if not seqs:
             continue
-        ax_fwd.plot(seqs, fwds, marker="o", color=color, label=label)
-        if ax_bwd is not None:
-            ax_bwd.plot(seqs, bwds, marker="s", color=color, label=label, linestyle="--")
+        series_by_panel = {
+            "Forward time": (fwds, "o", "-"),
+            "Backward time": (bwds, "s", "--"),
+            "Forward peak memory": (fwd_peaks, "o", "-"),
+            "Forward residual memory": (fwd_resids, "^", "-"),
+            "Backward peak memory": (bwd_peaks, "s", "--"),
+        }
+        for ax, (panel_name, _unit, _idx) in zip(axes_flat, panels):
+            ys, marker, ls = series_by_panel[panel_name]
+            ax.plot(seqs, ys, marker=marker, linestyle=ls, color=color, label=label)
 
-    for ax, panel_title in (
-        (ax_fwd, "Forward"),
-        *([(ax_bwd, "Backward")] if ax_bwd is not None else []),
-    ):
+    for ax, (panel_name, unit, _idx) in zip(axes_flat, panels):
         if log_x:
             ax.set_xscale("log", base=2)
-        if log_y:
+        # Only log-scale the time panels; memory panels stay linear so
+        # zeros (e.g. kernels with no residual memory) render correctly.
+        if log_y and unit == "ms":
             ax.set_yscale("log")
         ax.set_xlabel("Sequence length")
-        ax.set_ylabel("Time (ms, median)")
-        ax.set_title(panel_title)
+        ax.set_ylabel(f"{'Time' if unit == 'ms' else 'Memory'} ({unit})")
+        ax.set_title(panel_name)
         ax.grid(True, which="both", linestyle=":", alpha=0.5)
         ax.legend(fontsize=8)
 
     base_title = title or (
-        f"Attention latency vs seqlen  "
+        f"Attention vs seqlen  "
         f"(b={cfg_template.batch}, h={cfg_template.nheads}, "
         f"d={cfg_template.head_dim}, dtype={dtype_str(cfg_template.dtype)}, "
         f"causal={cfg_template.causal})"

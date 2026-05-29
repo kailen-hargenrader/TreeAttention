@@ -107,6 +107,9 @@ def print_table(rows: list[dict], baseline_name: str = PRIMARY_BASELINE) -> None
         ("bwd_ms",  "right",  lambda r: _fmt(r.get("bwd_ms_median"), ".3f")),
         ("fwd_TF/s","right",  lambda r: _fmt(r.get("fwd_tflops"), ".1f")),
         ("bwd_TF/s","right",  lambda r: _fmt(r.get("bwd_tflops"), ".1f")),
+        ("fwd_mem_MiB","right", lambda r: _fmt(r.get("fwd_peak_mem_mb"), ".1f")),
+        ("fwd_resid_MiB","right", lambda r: _fmt(r.get("fwd_residual_mem_mb"), ".1f")),
+        ("bwd_mem_MiB","right", lambda r: _fmt(r.get("bwd_peak_mem_mb"), ".1f")),
         (f"sp_fwd/{baseline_name}", "right", lambda r: _fmt(r.get(sp_fwd_key), ".2f")),
         (f"sp_bwd/{baseline_name}", "right", lambda r: _fmt(r.get(sp_bwd_key), ".2f")),
     ]

@@ -1,8 +1,12 @@
-"""CLI entrypoint: ``uv run python -m attn_bench.run --kernel pkg.mod:fn``.
+"""CLI entrypoint: ``uv run attn-bench --all --seqlens 2048,4096,...``
 
-Runs every configured baseline (default: FlashAttention-2) and the user's
-kernel-under-test across the sweep, writes CSV + JSON to ``--output-dir``,
-and prints a pretty results table with speedup-vs-FA2 columns.
+Sweep is always over sequence length; every other shape parameter is a
+scalar. Adapters are selected with one boolean flag per built-in
+(``--flash-attn-2``, ``--sdpa-efficient``, etc.) or ``--all``.
+
+Outer-to-inner loop order: adapter -> seqlen -> repeats (the per-repeat
+loop lives inside ``time_kernel``). When an adapter OOMs at some seqlen
+the remaining larger seqlens are skipped for that adapter only.
 """
 
 from __future__ import annotations
@@ -16,17 +20,11 @@ from pathlib import Path
 
 import torch
 
-from attn_bench.adapters import KernelAdapter, load_entrypoint
+from attn_bench.adapters import KernelAdapter
 from attn_bench.baselines import BUILTIN_BASELINES, get_baseline
-from attn_bench.configs import (
-    BenchConfig,
-    build_sweep,
-    default_sweep,
-    dtype_str,
-    load_sweep,
-    parse_dtype,
-)
+from attn_bench.configs import BenchConfig, dtype_str, parse_dtype
 from attn_bench.harness import run_sweep
+from attn_bench.plot_seqlen import _plot as _plot_seqlen
 from attn_bench.reporting import (
     PRIMARY_BASELINE,
     annotate_speedups,
@@ -40,21 +38,6 @@ def _parse_int_list(s: str) -> list[int]:
     return [int(x) for x in s.split(",") if x.strip()]
 
 
-def _parse_bool_list(s: str) -> list[bool]:
-    out: list[bool] = []
-    for x in s.split(","):
-        x = x.strip().lower()
-        if x in {"true", "t", "1", "yes", "y"}:
-            out.append(True)
-        elif x in {"false", "f", "0", "no", "n"}:
-            out.append(False)
-    return out
-
-
-def _parse_dtype_list(s: str) -> list[torch.dtype]:
-    return [parse_dtype(x) for x in s.split(",") if x.strip()]
-
-
 def _git_sha(cwd: Path | None = None) -> str:
     try:
         out = subprocess.check_output(
@@ -65,95 +48,89 @@ def _git_sha(cwd: Path | None = None) -> str:
         return "nogit"
 
 
+def _flag_name(baseline: str) -> str:
+    """``treeattn_torch`` -> ``--treeattn-torch``."""
+    return "--" + baseline.replace("_", "-")
+
+
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="attn-bench",
-        description="Benchmark an attention CUDA kernel against FlashAttention-2 on A100.",
-    )
-    p.add_argument(
-        "--kernel",
-        help="Entrypoint of the kernel-under-test, e.g. 'my_pkg.mod:attn_fn' "
-             "(omit to benchmark only the baselines).",
-    )
-    p.add_argument(
-        "--baselines",
-        default=PRIMARY_BASELINE,
-        help=f"Comma-separated baseline names. Available: {','.join(BUILTIN_BASELINES)}. "
-             f"Default: {PRIMARY_BASELINE}.",
-    )
-    p.add_argument("--config", help="Path to YAML/JSON sweep config (overrides defaults).")
-    p.add_argument("--warmup", type=int, default=10, help="Warmup iterations per cell.")
-    p.add_argument("--iters", type=int, default=50, help="Measured iterations per cell.")
-    p.add_argument("--output-dir", default="results", help="Directory for CSV+JSON outputs.")
-    p.add_argument("--no-backward", action="store_true", help="Skip backward-pass timing.")
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument(
-        "--treeattn-num-samples",
-        type=int,
-        default=None,
-        help="If set, run treeattn_torch / treeattn_jax in stochastic mode "
-             "with this many sampled paths per query (sets "
-             "TREEATTN_NUM_SAMPLES). "
-             "Default: deterministic (exact).",
+        description="Benchmark attention kernels across a sequence-length sweep.",
     )
 
-    # Sweep overrides (apply on top of defaults; ignored if --config is set).
-    p.add_argument("--batches", type=_parse_int_list, default=None, help="e.g. '1,2'")
-    p.add_argument("--nheads", type=_parse_int_list, default=None, help="e.g. '8,16'")
-    p.add_argument("--head-dims", type=_parse_int_list, default=None, help="e.g. '64,128'")
-    p.add_argument("--seqlens", type=_parse_int_list, default=None, help="e.g. '512,1024,2048'")
-    p.add_argument("--causal", type=_parse_bool_list, default=None, help="e.g. 'false,true'")
-    p.add_argument("--dtypes", type=_parse_dtype_list, default=None, help="e.g. 'bf16,fp16'")
+    # One boolean flag per built-in adapter; flags auto-generated.
+    adapters_group = p.add_argument_group("adapter selection")
+    for name in BUILTIN_BASELINES:
+        adapters_group.add_argument(
+            _flag_name(name), dest=name, action="store_true",
+            help=f"Include the {name!r} adapter.",
+        )
+    adapters_group.add_argument(
+        "--all", dest="all_adapters", action="store_true",
+        help="Run every built-in adapter.",
+    )
+
+    # Sweep axis (the only multi-valued arg).
+    p.add_argument(
+        "--seqlens", type=_parse_int_list,
+        default=[1 << e for e in range(11, 21)],
+        help="Comma-separated sequence lengths to sweep. Default: 2^11..2^20.",
+    )
+
+    # Fixed shape parameters.
+    p.add_argument("--batch", type=int, default=1, help="Batch size (default: 1).")
+    p.add_argument("--nheads", type=int, default=2, help="Number of attention heads (default: 2).")
+    p.add_argument("--head-dim", type=int, default=64, help="Per-head dimension (default: 64).")
+    p.add_argument("--dtype", default="bf16", help="bf16 | fp16 | fp32 (default: bf16).")
+    causal_group = p.add_mutually_exclusive_group()
+    causal_group.add_argument("--causal", dest="causal", action="store_true",
+                              help="Use a causal mask.")
+    causal_group.add_argument("--no-causal", dest="causal", action="store_false",
+                              help="Disable causal mask (default).")
+    p.set_defaults(causal=False)
+
+    # Timing knobs.
+    p.add_argument("--warmup", type=int, default=10,
+                   help="Warmup iterations per (adapter, seqlen) cell.")
+    p.add_argument("--iters", type=int, default=50,
+                   help="Measured repeats per (adapter, seqlen) cell.")
+    p.add_argument("--seed", type=int, default=0)
+
+    # Misc.
+    p.add_argument("--output-dir", default="results", help="Directory for CSV+JSON outputs.")
+    p.add_argument("--no-backward", action="store_true", help="Skip backward-pass timing.")
+    p.add_argument("--no-plot", action="store_true", help="Skip PNG plot generation.")
+    p.add_argument(
+        "--treeattn-num-samples", type=int, default=None,
+        help="If set, run treeattn_torch / treeattn_jax in stochastic mode with this many "
+             "sampled paths per query (sets TREEATTN_NUM_SAMPLES). Default: deterministic.",
+    )
 
     return p
 
 
-def _build_sweep_from_args(args: argparse.Namespace) -> list[BenchConfig]:
-    if args.config:
-        return load_sweep(args.config)
-    if any(
-        x is not None
-        for x in (args.batches, args.nheads, args.head_dims, args.seqlens, args.causal, args.dtypes)
-    ):
-        return build_sweep(
-            batches=args.batches or [2],
-            nheads_list=args.nheads or [16],
-            head_dims=args.head_dims or [64, 128],
-            seqlens=args.seqlens or [512, 1024, 2048, 4096, 8192, 16384],
-            causals=args.causal if args.causal is not None else [False, True],
-            dtypes=args.dtypes or [torch.bfloat16],
-        )
-    return default_sweep()
-
-
 def _collect_adapters(args: argparse.Namespace) -> list[KernelAdapter]:
-    adapters: list[KernelAdapter] = []
-    seen: set[str] = set()
+    if args.all_adapters:
+        names = list(BUILTIN_BASELINES)
+    else:
+        names = [name for name in BUILTIN_BASELINES if getattr(args, name, False)]
+    return [get_baseline(n) for n in names]
 
-    baseline_names = [b.strip() for b in args.baselines.split(",") if b.strip()]
-    for name in baseline_names:
-        try:
-            ad = get_baseline(name)
-        except KeyError as e:
-            print(f"[warn] {e}", file=sys.stderr)
-            continue
-        adapters.append(ad)
-        seen.add(ad.name)
 
-    if args.kernel:
-        ad = load_entrypoint(args.kernel)
-        if ad.name in seen:
-            ad = KernelAdapter(
-                name=ad.name + "_user", fn=ad.fn,
-                supports_backward=ad.supports_backward,
-                supports_causal=ad.supports_causal,
-                allowed_dtypes=ad.allowed_dtypes,
-                allowed_head_dims=ad.allowed_head_dims,
-                layout=ad.layout,
-            )
-        adapters.append(ad)
-
-    return adapters
+def _build_sweep(args: argparse.Namespace) -> list[BenchConfig]:
+    dtype = parse_dtype(args.dtype)
+    return [
+        BenchConfig(
+            batch=args.batch,
+            seqlen=s,
+            nheads=args.nheads,
+            head_dim=args.head_dim,
+            dtype=dtype,
+            causal=args.causal,
+        )
+        for s in sorted(set(args.seqlens))
+    ]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -169,11 +146,11 @@ def main(argv: list[str] | None = None) -> int:
 
     adapters = _collect_adapters(args)
     if not adapters:
-        print("ERROR: no adapters to benchmark (specify --kernel or valid --baselines).",
-              file=sys.stderr)
+        flags = ", ".join(_flag_name(n) for n in BUILTIN_BASELINES)
+        print(f"ERROR: no adapters selected. Pass --all or one of: {flags}.", file=sys.stderr)
         return 2
 
-    sweep = _build_sweep_from_args(args)
+    sweep = _build_sweep(args)
 
     ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     run_id = f"{ts}-{_git_sha(Path.cwd())}"
@@ -205,16 +182,24 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"[run] {run_id} on {device_name}")
     print(f"[run] adapters: {[a.name for a in adapters]}")
-    print(f"[run] sweep: {len(sweep)} configs x {len(adapters)} kernels "
+    print(f"[run] sweep: {len(sweep)} seqlens x {len(adapters)} adapters "
           f"= {len(sweep) * len(adapters)} cells")
 
     def on_result(r):
-        marker = {"ok": "✓", "oom": "OOM", "skipped": "skip", "error": "ERR"}.get(r.status, r.status)
-        fwd = r.fwd.median_ms if r.fwd else float("nan")
-        bwd = r.bwd.median_ms if r.bwd else float("nan")
-        print(f"  [{marker:>4}] {r.kernel:<24} {r.config.label}  "
-              f"fwd={fwd:.3f}ms  bwd={bwd:.3f}ms"
-              + (f"  ({r.skip_reason or r.error_msg})" if r.status != "ok" else ""))
+        marker = {"ok": "ok", "oom": "OOM", "skipped": "skip", "error": "ERR"}.get(r.status, r.status)
+        cfg = r.config
+        shape = f"s={cfg.seqlen:<7}"
+        if r.status == "ok":
+            fwd = r.fwd.median_ms if r.fwd else float("nan")
+            bwd = r.bwd.median_ms if r.bwd else float("nan")
+            print(
+                f"  [{marker:>4}] {r.kernel:<16} {shape}  "
+                f"fwd={fwd:7.3f}ms  bwd={bwd:7.3f}ms  "
+                f"mem(fwd/bwd)={r.fwd_peak_mem_mb:7.1f}/{r.bwd_peak_mem_mb:7.1f} MiB"
+            )
+        else:
+            # OOM / skip / error: just the status, no details.
+            print(f"  [{marker:>4}] {r.kernel:<16} {shape}")
 
     results = run_sweep(
         adapters, sweep,
@@ -232,7 +217,32 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print(f"[run] wrote {out_dir / 'results.csv'}")
     print(f"[run] wrote {out_dir / 'results.json'}")
+
+    if not args.no_plot:
+        _autoplot(adapters, results, out_dir, do_backward=not args.no_backward)
     return 0
+
+
+def _autoplot(adapters, results, out_dir: Path, *, do_backward: bool) -> None:
+    """Emit one PNG covering the seqlen sweep, one line per adapter."""
+    ok_seqs = sorted({r.config.seqlen for r in results if r.status == "ok"})
+    if len(ok_seqs) < 2:
+        return
+    template = results[0].config
+    fname = (
+        f"seqlen_b{template.batch}_h{template.nheads}_d{template.head_dim}_"
+        f"{dtype_str(template.dtype)}_"
+        f"{'causal' if template.causal else 'noncausal'}.png"
+    )
+    out_path = out_dir / fname
+    try:
+        _plot_seqlen(
+            [(a.name, a) for a in adapters], results, template, out_path,
+            do_backward=do_backward, log_x=True, log_y=True, title=None,
+        )
+        print(f"[run] wrote {out_path}")
+    except Exception as e:
+        print(f"[warn] plot failed for {fname}: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":  # pragma: no cover

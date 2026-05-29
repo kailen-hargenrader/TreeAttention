@@ -46,3 +46,18 @@ def test_sdpa_smoke() -> None:
     assert res.status == "ok", res.error_msg or res.skip_reason
     assert res.fwd is not None and math.isfinite(res.fwd.median_ms)
     assert res.fwd.median_ms > 0
+
+
+def test_peak_memory_reported() -> None:
+    cfg = _tiny_cfg()
+    res = time_kernel(sdpa.adapter(), cfg, warmup=2, iters=5)
+    assert res.status == "ok", res.error_msg or res.skip_reason
+    assert math.isfinite(res.fwd_peak_mem_mb)
+    assert res.fwd_peak_mem_mb > 0
+    assert math.isfinite(res.bwd_peak_mem_mb)
+    # fwd+bwd retains activations and produces grads, so should use at
+    # least as much memory as a pure forward.
+    assert res.bwd_peak_mem_mb >= res.fwd_peak_mem_mb
+    row = res.row()
+    assert "fwd_peak_mem_mb" in row
+    assert "bwd_peak_mem_mb" in row

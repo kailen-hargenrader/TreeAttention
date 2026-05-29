@@ -70,11 +70,11 @@ def default_sweep() -> list[BenchConfig]:
     Matches the shape grid commonly used in FA2's own A100 benchmarks, in
     bf16 (primary) and fp16 (secondary).
     """
-    batches = [2]
-    nheads_list = [16]
-    head_dims = [64, 128]
-    seqlens = [512, 1024, 2048, 4096, 8192, 16384]
-    causals = [False, True]
+    batches = [1]
+    nheads_list = [2]
+    head_dims = [64]
+    seqlens = [1 << e for e in range(11, 21)]
+    causals = [False]
     dtypes = [torch.bfloat16, torch.float16]
 
     out: list[BenchConfig] = []
@@ -95,11 +95,11 @@ def default_sweep() -> list[BenchConfig]:
 
 def build_sweep(
     *,
-    batches: Iterable[int] = (2,),
-    nheads_list: Iterable[int] = (16,),
-    head_dims: Iterable[int] = (64, 128),
-    seqlens: Iterable[int] = (512, 1024, 2048, 4096, 8192, 16384),
-    causals: Iterable[bool] = (False, True),
+    batches: Iterable[int] = (1,),
+    nheads_list: Iterable[int] = (2,),
+    head_dims: Iterable[int] = (64,),
+    seqlens: Iterable[int] = tuple(1 << e for e in range(11, 21)),
+    causals: Iterable[bool] = (False,),
     dtypes: Iterable[torch.dtype] = (torch.bfloat16,),
 ) -> list[BenchConfig]:
     """Cartesian-product builder used by the CLI for ``--seqlens`` etc."""
@@ -156,10 +156,10 @@ def load_sweep(path: str | Path) -> list[BenchConfig]:
         ]
 
     return build_sweep(
-        batches=data.get("batches", [2]),
-        nheads_list=data.get("nheads", [16]),
-        head_dims=data.get("head_dims", [64, 128]),
-        seqlens=data.get("seqlens", [512, 1024, 2048, 4096, 8192, 16384]),
-        causals=data.get("causals", [False, True]),
+        batches=data.get("batches", [1]),
+        nheads_list=data.get("nheads", [2]),
+        head_dims=data.get("head_dims", [64]),
+        seqlens=data.get("seqlens", [1 << e for e in range(11, 21)]),
+        causals=data.get("causals", [False]),
         dtypes=[parse_dtype(d) for d in data.get("dtypes", ["bf16"])],
     )

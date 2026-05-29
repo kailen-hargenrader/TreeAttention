@@ -72,6 +72,9 @@ class Result:
     bwd: Optional[TimingStats] = None
     fwd_tflops: float = float("nan")
     bwd_tflops: float = float("nan")
+    fwd_peak_mem_mb: float = float("nan")
+    fwd_residual_mem_mb: float = float("nan")
+    bwd_peak_mem_mb: float = float("nan")
     error_msg: str = ""
     skip_reason: str = ""
     extra: dict = field(default_factory=dict)
@@ -97,6 +100,8 @@ class Result:
                 "fwd_ms_p10": self.fwd.p10_ms,
                 "fwd_ms_p90": self.fwd.p90_ms,
                 "fwd_tflops": self.fwd_tflops,
+                "fwd_peak_mem_mb": self.fwd_peak_mem_mb,
+                "fwd_residual_mem_mb": self.fwd_residual_mem_mb,
             })
         if self.bwd is not None:
             row.update({
@@ -106,6 +111,7 @@ class Result:
                 "bwd_ms_p10": self.bwd.p10_ms,
                 "bwd_ms_p90": self.bwd.p90_ms,
                 "bwd_tflops": self.bwd_tflops,
+                "bwd_peak_mem_mb": self.bwd_peak_mem_mb,
             })
         if self.error_msg:
             row["error_msg"] = self.error_msg
@@ -144,6 +150,37 @@ def _time_callable(fn, *, warmup: int, iters: int) -> list[float]:
     torch.cuda.synchronize()
 
     return [s.elapsed_time(e) for s, e in zip(starts, ends)]
+
+
+def _measure_peak_mem_mb(fn) -> float:
+    """Run ``fn()`` once and return the CUDA peak allocated bytes (MiB).
+
+    Resets the peak stats immediately before the call so the value reflects
+    only this invocation's allocations (subject to the caching allocator's
+    pre-existing reservations).
+    """
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    fn()
+    torch.cuda.synchronize()
+    return torch.cuda.max_memory_allocated() / (1024 * 1024)
+
+
+def _measure_fwd_residual_mb(fn) -> float:
+    """Memory still allocated after ``fn()`` returns and its output is dropped.
+
+    Captures allocator state before the call, runs the call, drops the
+    returned tensor, and returns the delta in allocated bytes (MiB). A
+    kernel that frees everything it allocated will report ~0; a kernel
+    that retains internal buffers will report >0.
+    """
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    out = fn()
+    del out
+    torch.cuda.synchronize()
+    after = torch.cuda.memory_allocated()
+    return max(after - before, 0) / (1024 * 1024)
 
 
 def time_kernel(
@@ -189,8 +226,22 @@ def time_kernel(
         fwd_flops_val = fwd_flops(cfg.batch, cfg.seqlen, cfg.nheads, cfg.head_dim, cfg.causal)
         fwd_tf = tflops_per_sec(fwd_flops_val, fwd_stats.median_ms)
 
+        # Peak-memory measurement for the forward pass. One extra call with
+        # the allocator's peak counter reset; reported in MiB.
+        fwd_peak_mb = _measure_peak_mem_mb(fwd_only)
+
+        # Residual memory: what's still allocated after a forward whose
+        # output has been dropped. Catches kernels that retain internal
+        # workspace tensors.
+        def fwd_returning():
+            with torch.no_grad():
+                return adapter.fn(q, k, v, cfg.causal, softmax_scale)
+
+        fwd_residual_mb = _measure_fwd_residual_mb(fwd_returning)
+
         bwd_stats: Optional[TimingStats] = None
         bwd_tf = float("nan")
+        bwd_peak_mb = float("nan")
 
         if want_bwd:
             # Rebuild inputs with grads so each backward call has fresh leaves.
@@ -223,6 +274,10 @@ def time_kernel(
             bwd_flops_val = bwd_flops(cfg.batch, cfg.seqlen, cfg.nheads, cfg.head_dim, cfg.causal)
             bwd_tf = tflops_per_sec(bwd_flops_val, bwd_stats.median_ms)
 
+            # Peak memory for a full fwd+bwd step (includes activations
+            # retained for autograd plus grad buffers).
+            bwd_peak_mb = _measure_peak_mem_mb(bwd_step)
+
         return Result(
             kernel=adapter.name,
             config=cfg,
@@ -231,6 +286,9 @@ def time_kernel(
             bwd=bwd_stats,
             fwd_tflops=fwd_tf,
             bwd_tflops=bwd_tf,
+            fwd_peak_mem_mb=fwd_peak_mb,
+            fwd_residual_mem_mb=fwd_residual_mb,
+            bwd_peak_mem_mb=bwd_peak_mb,
         )
 
     except torch.cuda.OutOfMemoryError as e:
@@ -263,17 +321,66 @@ def run_sweep(
     do_backward: bool = True,
     seed: int = 0,
     on_result=None,
+    leak_threshold_mb: float = 1.0,
 ) -> list[Result]:
-    """Run every (adapter, config) pair. Calls ``on_result`` after each cell."""
+    """Run every (adapter, config) pair. Calls ``on_result`` after each cell.
+
+    Loop order is **adapter -> config** (outer to inner) so each adapter
+    completes its full sweep before the next one starts. Between cells,
+    drops references and calls ``torch.cuda.empty_cache``. If the allocator
+    still holds more than ``leak_threshold_mb`` MiB more than it did before
+    the cell started, prints a warning identifying the offending pair.
+
+    OOM short-circuit: once an adapter hits ``status="oom"`` at some
+    seqlen, every later config with a larger seqlen is skipped for that
+    adapter (with ``status="skipped"`` and a descriptive ``skip_reason``).
+    The short-circuit resets per adapter.
+    """
+    import sys as _sys
     results: list[Result] = []
-    for cfg in sweep:
-        for adapter in adapters:
+    for adapter in adapters:
+        oom_at_seqlen: int | None = None
+        for cfg in sweep:
+            if oom_at_seqlen is not None and cfg.seqlen > oom_at_seqlen:
+                res = Result(
+                    kernel=adapter.name, config=cfg, status="skipped",
+                    skip_reason=f"prior OOM at s={oom_at_seqlen}",
+                )
+                results.append(res)
+                if on_result is not None:
+                    on_result(res)
+                continue
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                mem_before = torch.cuda.memory_allocated()
+            else:
+                mem_before = 0
+
             t0 = time.perf_counter()
             res = time_kernel(
                 adapter, cfg, warmup=warmup, iters=iters,
                 do_backward=do_backward, seed=seed,
             )
             res.extra["wallclock_s"] = time.perf_counter() - t0
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                mem_after = torch.cuda.memory_allocated()
+                leaked_mb = (mem_after - mem_before) / (1024 * 1024)
+                res.extra["leaked_mb"] = leaked_mb
+                if leaked_mb > leak_threshold_mb:
+                    print(
+                        f"[warn] leak: {adapter.name} s={cfg.seqlen} retained "
+                        f"{leaked_mb:.1f} MiB after empty_cache",
+                        file=_sys.stderr,
+                    )
+
+            if res.status == "oom":
+                oom_at_seqlen = cfg.seqlen
+
             results.append(res)
             if on_result is not None:
                 on_result(res)
