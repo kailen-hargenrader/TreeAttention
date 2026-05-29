@@ -16,6 +16,13 @@ Same convention as :mod:`attn_bench.baselines.treeattn_torch`:
 
 from __future__ import annotations
 
+import os as _os
+
+# Prevent JAX from preallocating ~75% of GPU memory on first use, which
+# would otherwise mask per-adapter peak-memory measurements. Set before
+# any `jax` import in the process. `setdefault` lets users override.
+_os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 from typing import Callable
 
 import torch

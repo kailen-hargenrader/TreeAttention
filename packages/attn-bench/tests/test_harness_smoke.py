@@ -15,7 +15,7 @@ import torch
 from attn_bench.baselines import sdpa
 from attn_bench.baselines.flash_attn2 import adapter as fa2_adapter, is_available as fa2_available
 from attn_bench.configs import BenchConfig
-from attn_bench.harness import time_kernel
+from attn_bench.harness import run_sweep_isolated, time_kernel
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -61,3 +61,17 @@ def test_peak_memory_reported() -> None:
     row = res.row()
     assert "fwd_peak_mem_mb" in row
     assert "bwd_peak_mem_mb" in row
+
+
+def test_isolated_runner_smoke() -> None:
+    """One adapter, one tiny config, via subprocess isolation."""
+    cfg = _tiny_cfg()
+    results = run_sweep_isolated(
+        ["sdpa_efficient"], [cfg], warmup=2, iters=3, do_backward=False,
+    )
+    assert len(results) == 1
+    res = results[0]
+    assert res.status == "ok", res.error_msg or res.skip_reason
+    assert res.kernel == "sdpa_efficient"
+    assert res.fwd is not None and math.isfinite(res.fwd.median_ms)
+    assert res.fwd.median_ms > 0

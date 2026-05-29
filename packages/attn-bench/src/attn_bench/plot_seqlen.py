@@ -140,17 +140,25 @@ def _collect_adapters(args: argparse.Namespace) -> list[tuple[str, KernelAdapter
         used.add(label)
         labeled.append((label, ad))
 
+    samples = args.treeattn_num_samples
+    suffix = f" (samples={samples})" if samples is not None else ""
+
+    def _decorate(label: str) -> str:
+        if suffix and "treeattn" in label:
+            return label + suffix
+        return label
+
     baseline_names = [b.strip() for b in args.baselines.split(",") if b.strip()]
     for name in baseline_names:
         try:
-            add(name, get_baseline(name))
+            add(_decorate(name), get_baseline(name))
         except KeyError as e:
             print(f"[warn] {e}", file=sys.stderr)
 
     for spec in args.kernel:
         label, ep = _parse_kernel_spec(spec)
         ad = load_entrypoint(ep)
-        add(label or ad.name, ad)
+        add(_decorate(label or ad.name), ad)
 
     return labeled
 
@@ -172,8 +180,8 @@ def _make_sweep(args: argparse.Namespace) -> list[BenchConfig]:
 
 def _series_from_results(
     results: list[Result], label: str, adapter_name: str,
-) -> tuple[list[int], list[float], list[float], list[float], list[float], list[float]]:
-    """Return (seqlens, fwd_ms, bwd_ms, fwd_peak_mb, fwd_resid_mb, bwd_peak_mb)
+) -> tuple[list[int], list[float], list[float], list[float], list[float], list[float], list[float]]:
+    """Return (seqlens, fwd_ms, bwd_ms, fwd_peak_mb, fwd_resid_mb, fwd_saved_mb, bwd_peak_mb)
     for one kernel, keeping only ``status=="ok"`` cells.
     """
     seqs: list[int] = []
@@ -181,6 +189,7 @@ def _series_from_results(
     bwds: list[float] = []
     fwd_peaks: list[float] = []
     fwd_resids: list[float] = []
+    fwd_saveds: list[float] = []
     bwd_peaks: list[float] = []
     for r in results:
         if r.kernel != adapter_name or r.status != "ok":
@@ -190,6 +199,7 @@ def _series_from_results(
         bwds.append(r.bwd.median_ms if r.bwd else float("nan"))
         fwd_peaks.append(r.fwd_peak_mem_mb)
         fwd_resids.append(r.fwd_residual_mem_mb)
+        fwd_saveds.append(r.fwd_saved_mem_mb)
         bwd_peaks.append(r.bwd_peak_mem_mb)
     order = sorted(range(len(seqs)), key=lambda i: seqs[i])
     return (
@@ -198,6 +208,7 @@ def _series_from_results(
         [bwds[i] for i in order],
         [fwd_peaks[i] for i in order],
         [fwd_resids[i] for i in order],
+        [fwd_saveds[i] for i in order],
         [bwd_peaks[i] for i in order],
     )
 
@@ -223,8 +234,9 @@ def _plot(
         panels.append(("Backward time", "ms", 2))
     panels.append(("Forward peak memory", "MiB", 3))
     panels.append(("Forward residual memory", "MiB", 4))
+    panels.append(("Forward saved for backward", "MiB", 5))
     if do_backward:
-        panels.append(("Backward peak memory", "MiB", 5))
+        panels.append(("Backward peak memory", "MiB", 6))
 
     n = len(panels)
     ncols = min(n, 3)
@@ -237,7 +249,7 @@ def _plot(
     cmap = plt.get_cmap("tab10")
     for i, (label, adapter) in enumerate(labeled):
         color = cmap(i % 10)
-        seqs, fwds, bwds, fwd_peaks, fwd_resids, bwd_peaks = _series_from_results(
+        seqs, fwds, bwds, fwd_peaks, fwd_resids, fwd_saveds, bwd_peaks = _series_from_results(
             results, label, adapter.name,
         )
         if not seqs:
@@ -247,6 +259,7 @@ def _plot(
             "Backward time": (bwds, "s", "--"),
             "Forward peak memory": (fwd_peaks, "o", "-"),
             "Forward residual memory": (fwd_resids, "^", "-"),
+            "Forward saved for backward": (fwd_saveds, "D", "-"),
             "Backward peak memory": (bwd_peaks, "s", "--"),
         }
         for ax, (panel_name, _unit, _idx) in zip(axes_flat, panels):
@@ -256,10 +269,12 @@ def _plot(
     for ax, (panel_name, unit, _idx) in zip(axes_flat, panels):
         if log_x:
             ax.set_xscale("log", base=2)
-        # Only log-scale the time panels; memory panels stay linear so
-        # zeros (e.g. kernels with no residual memory) render correctly.
-        if log_y and unit == "ms":
-            ax.set_yscale("log")
+        if log_y:
+            if panel_name == "Forward residual memory":
+                # symlog so zero-residual kernels still render.
+                ax.set_yscale("symlog", linthresh=1.0)
+            else:
+                ax.set_yscale("log")
         ax.set_xlabel("Sequence length")
         ax.set_ylabel(f"{'Time' if unit == 'ms' else 'Memory'} ({unit})")
         ax.set_title(panel_name)

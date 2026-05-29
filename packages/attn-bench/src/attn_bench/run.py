@@ -11,6 +11,13 @@ the remaining larger seqlens are skipped for that adapter only.
 
 from __future__ import annotations
 
+import os as _os
+
+# Disable JAX's default GPU preallocation (~75% of device memory) so each
+# adapter's true peak memory is observable independently. Must be set
+# before `jax` is imported anywhere in the process.
+_os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import argparse
 import datetime as dt
 import json
@@ -23,7 +30,7 @@ import torch
 from attn_bench.adapters import KernelAdapter
 from attn_bench.baselines import BUILTIN_BASELINES, get_baseline
 from attn_bench.configs import BenchConfig, dtype_str, parse_dtype
-from attn_bench.harness import run_sweep
+from attn_bench.harness import run_sweep, run_sweep_isolated
 from attn_bench.plot_seqlen import _plot as _plot_seqlen
 from attn_bench.reporting import (
     PRIMARY_BASELINE,
@@ -101,6 +108,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", default="results", help="Directory for CSV+JSON outputs.")
     p.add_argument("--no-backward", action="store_true", help="Skip backward-pass timing.")
     p.add_argument("--no-plot", action="store_true", help="Skip PNG plot generation.")
+    p.add_argument(
+        "--no-isolate", dest="isolate", action="store_false",
+        help="Run all adapters in-process (debug). Default isolates each adapter "
+             "in its own subprocess so CUDA / framework allocators are torn down between adapters.",
+    )
+    p.set_defaults(isolate=True)
     p.add_argument(
         "--treeattn-num-samples", type=int, default=None,
         help="If set, run treeattn_torch / treeattn_jax in stochastic mode with this many "
@@ -206,6 +219,11 @@ def main(argv: list[str] | None = None) -> int:
         warmup=args.warmup, iters=args.iters,
         do_backward=not args.no_backward, seed=args.seed,
         on_result=on_result,
+    ) if not args.isolate else run_sweep_isolated(
+        [a.name for a in adapters], sweep,
+        warmup=args.warmup, iters=args.iters,
+        do_backward=not args.no_backward, seed=args.seed,
+        on_result=on_result,
     )
 
     rows = annotate_speedups(results, baseline_name=PRIMARY_BASELINE)
@@ -219,11 +237,18 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[run] wrote {out_dir / 'results.json'}")
 
     if not args.no_plot:
-        _autoplot(adapters, results, out_dir, do_backward=not args.no_backward)
+        _autoplot(
+            adapters, results, out_dir,
+            do_backward=not args.no_backward,
+            treeattn_num_samples=args.treeattn_num_samples,
+        )
     return 0
 
 
-def _autoplot(adapters, results, out_dir: Path, *, do_backward: bool) -> None:
+def _autoplot(
+    adapters, results, out_dir: Path, *, do_backward: bool,
+    treeattn_num_samples: int | None = None,
+) -> None:
     """Emit one PNG covering the seqlen sweep, one line per adapter."""
     ok_seqs = sorted({r.config.seqlen for r in results if r.status == "ok"})
     if len(ok_seqs) < 2:
@@ -235,9 +260,14 @@ def _autoplot(adapters, results, out_dir: Path, *, do_backward: bool) -> None:
         f"{'causal' if template.causal else 'noncausal'}.png"
     )
     out_path = out_dir / fname
+    suffix = f" (samples={treeattn_num_samples})" if treeattn_num_samples is not None else ""
+    labeled = [
+        (a.name + suffix if (suffix and "treeattn" in a.name) else a.name, a)
+        for a in adapters
+    ]
     try:
         _plot_seqlen(
-            [(a.name, a) for a in adapters], results, template, out_path,
+            labeled, results, template, out_path,
             do_backward=do_backward, log_x=True, log_y=True, title=None,
         )
         print(f"[run] wrote {out_path}")
