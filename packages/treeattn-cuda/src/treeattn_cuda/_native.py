@@ -29,6 +29,7 @@ def _load_extension():
     sources = [
         str(csrc_dir / "accumulate_qk_non_causal_all_depths.cu"),
         str(csrc_dir / "accumulate_qk_non_causal.cu"),
+        str(csrc_dir / "backward_prepare_non_causal.cu"),
         str(csrc_dir / "compute_grad_logit_non_causal.cu"),
         str(csrc_dir / "scatter_weighted_grad_v.cu"),
         str(csrc_dir / "sample_non_causal_paths.cu"),
@@ -58,6 +59,8 @@ def has_native_kernels() -> bool:
     ) and hasattr(
         extension, "sample_non_causal_paths_forward"
     ) and hasattr(
+        extension, "prepare_non_causal_backward"
+    ) and hasattr(
         extension, "scatter_weighted_grad_v_forward"
     ) and hasattr(
         extension, "weighted_value_sum_forward"
@@ -76,6 +79,20 @@ def replay_non_causal_paths_forward(q, k, packed_paths, max_logit):
     if extension is None:
         return None
     return extension.replay_non_causal_paths_forward(q, k, packed_paths, max_logit)
+
+
+def prepare_non_causal_backward(q, k, v, packed_paths, grad_output, max_logit):
+    extension = _load_extension()
+    if extension is None:
+        return None
+    return extension.prepare_non_causal_backward(
+        q,
+        k,
+        v,
+        packed_paths,
+        grad_output,
+        max_logit,
+    )
 
 
 def sample_non_causal_paths_forward(q, k, num_samples, block_size, max_logit):

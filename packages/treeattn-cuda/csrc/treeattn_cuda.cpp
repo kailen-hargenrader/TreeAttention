@@ -34,6 +34,15 @@ std::tuple<torch::Tensor, torch::Tensor> replay_non_causal_paths_forward_cuda(
   const torch::Tensor& packed_paths,
   double max_logit);
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+prepare_non_causal_backward_cuda(
+  const torch::Tensor& q,
+  const torch::Tensor& k,
+  const torch::Tensor& v,
+  const torch::Tensor& packed_paths,
+  const torch::Tensor& grad_output,
+  double max_logit);
+
 torch::Tensor scatter_weighted_grad_v_forward_cuda(
   const torch::Tensor& grad_output,
   const torch::Tensor& sampled_indices,
@@ -152,6 +161,56 @@ std::tuple<torch::Tensor, torch::Tensor> replay_non_causal_paths_forward(
       "packed_paths batch/head dimensions must match q");
 
   return replay_non_causal_paths_forward_cuda(q, k, packed_paths, max_logit);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> prepare_non_causal_backward(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& packed_paths,
+    const torch::Tensor& grad_output,
+    double max_logit) {
+  TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");
+  TORCH_CHECK(k.is_cuda(), "k must be a CUDA tensor");
+  TORCH_CHECK(v.is_cuda(), "v must be a CUDA tensor");
+  TORCH_CHECK(packed_paths.is_cuda(), "packed_paths must be a CUDA tensor");
+  TORCH_CHECK(grad_output.is_cuda(), "grad_output must be a CUDA tensor");
+  TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
+  TORCH_CHECK(k.is_contiguous(), "k must be contiguous");
+  TORCH_CHECK(v.is_contiguous(), "v must be contiguous");
+  TORCH_CHECK(packed_paths.is_contiguous(), "packed_paths must be contiguous");
+  TORCH_CHECK(grad_output.is_contiguous(), "grad_output must be contiguous");
+  TORCH_CHECK(q.dim() == 4, "q must have shape (L, B, H, D)");
+  TORCH_CHECK(k.dim() == 4, "k must have shape (K, B, H, D)");
+  TORCH_CHECK(v.dim() == 4, "v must have shape (N, B, H, D)");
+  TORCH_CHECK(grad_output.dim() == 4, "grad_output must have shape (L, B, H, D)");
+  TORCH_CHECK(packed_paths.dim() == 5, "packed_paths must have shape (L, B, H, S, P)");
+  TORCH_CHECK(q.scalar_type() == k.scalar_type(), "q and k must have the same dtype");
+  TORCH_CHECK(q.scalar_type() == v.scalar_type(), "q and v must have the same dtype");
+  TORCH_CHECK(q.scalar_type() == grad_output.scalar_type(), "q and grad_output must have the same dtype");
+  TORCH_CHECK(
+      is_supported_treeattn_dtype(q.scalar_type()),
+      "q, k, v, and grad_output must be float32, float16, or bfloat16");
+  TORCH_CHECK(packed_paths.scalar_type() == torch::kUInt8, "packed_paths must be uint8");
+  TORCH_CHECK(k.size(0) > 0, "prepare_non_causal_backward expects K > 0");
+  TORCH_CHECK(packed_paths.size(3) > 0, "packed_paths must have at least one sample");
+  TORCH_CHECK(packed_paths.size(3) <= 32, "prepare_non_causal_backward currently supports S <= 32");
+  TORCH_CHECK(q.size(0) == packed_paths.size(0), "query length must match packed_paths");
+  TORCH_CHECK(q.size(0) == grad_output.size(0), "query length must match grad_output");
+  TORCH_CHECK(q.size(1) == k.size(1) && q.size(2) == k.size(2), "q and k batch/head dimensions must match");
+  TORCH_CHECK(q.size(1) == v.size(1) && q.size(2) == v.size(2), "q and v batch/head dimensions must match");
+  TORCH_CHECK(q.size(1) == grad_output.size(1) && q.size(2) == grad_output.size(2), "q and grad_output batch/head dimensions must match");
+  TORCH_CHECK(
+      q.size(1) == packed_paths.size(1) && q.size(2) == packed_paths.size(2),
+      "packed_paths batch/head dimensions must match q");
+
+  return prepare_non_causal_backward_cuda(
+      q,
+      k,
+      v,
+      packed_paths,
+      grad_output,
+      max_logit);
 }
 
 torch::Tensor scatter_weighted_grad_v_forward(
@@ -321,8 +380,8 @@ void accumulate_qk_non_causal_all_depths_inplace(
   TORCH_CHECK(grad_log_probs.scalar_type() == torch::kFloat32, "grad_log_probs must be float32");
   TORCH_CHECK(grad_q_out.scalar_type() == torch::kFloat32, "grad_q_out must be float32");
     TORCH_CHECK(
-      grad_k_out.scalar_type() == torch::kFloat32 || grad_k_out.scalar_type() == q.scalar_type(),
-      "grad_k_out must be float32 or match q/k dtype");
+        grad_k_out.scalar_type() == torch::kFloat32,
+        "grad_k_out must be float32");
   TORCH_CHECK(q.size(0) == packed_paths.size(0), "query length must match packed_paths");
   TORCH_CHECK(q.size(0) == grad_log_probs.size(0), "query length must match grad_log_probs");
   TORCH_CHECK(q.size(0) == grad_q_out.size(0), "query length must match grad_q_out");
@@ -348,6 +407,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("accumulate_qk_non_causal_inplace", &accumulate_qk_non_causal_inplace, "Accumulate non-causal q/k backward contributions in place (CUDA)");
   m.def("compute_grad_logit_non_causal_forward", &compute_grad_logit_non_causal_forward, "Compute non-causal grad_logit for one backward depth (CUDA)");
   m.def("sample_non_causal_paths_forward", &sample_non_causal_paths_forward, "Sample non-causal tree paths forward (CUDA)");
+  m.def("prepare_non_causal_backward", &prepare_non_causal_backward, "Prepare sampled leaves and grad_log_probs for non-causal backward (CUDA)");
   m.def("scatter_weighted_grad_v_forward", &scatter_weighted_grad_v_forward, "Scatter weighted grad_v updates (CUDA)");
   m.def("weighted_value_sum_forward", &weighted_value_sum_forward, "Weighted tree value sum forward (CUDA)");
   m.def("replay_non_causal_paths_forward", &replay_non_causal_paths_forward, "Replay packed non-causal tree paths (CUDA)");

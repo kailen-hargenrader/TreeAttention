@@ -27,6 +27,8 @@ from treeattn_cuda._autograd import (
     _accumulate_qk_non_causal_all_depths_inplace,
     _accumulate_qk_non_causal_inplace,
     _compute_grad_logit_non_causal,
+    _prepare_non_causal_backward,
+    _prepare_non_causal_backward_python,
     _replay_non_causal_paths,
     _replay_non_causal_paths_python,
     _scatter_tree_updates,
@@ -205,6 +207,54 @@ def test_treeattn_cuda_native_replay_supports_bf16(monkeypatch: pytest.MonkeyPat
     assert stats["replay_python_calls"] == 0
     assert torch.equal(native_indices, python_indices)
     torch.testing.assert_close(native_log_probs, python_log_probs)
+
+
+def test_treeattn_cuda_native_prepare_backward_matches_python(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TREEATTN_CUDA_BUILD", "1")
+    if not treeattn_cuda_native.has_native_kernels():
+        pytest.skip("treeattn_cuda native backward prepare kernel not enabled")
+
+    torch.manual_seed(0)
+    q = torch.randn((8, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((7, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn((8, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
+    grad_output = torch.randn((8, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
+    _, _, packed_paths = _sample_paths_non_causal_streaming_python(
+        q,
+        k,
+        num_samples=4,
+        block_size=4,
+        max_logit=1e3,
+    )
+
+    reset_runtime_stats()
+    native_indices, native_attn, native_grad_log_probs = _prepare_non_causal_backward(
+        q,
+        k,
+        v,
+        packed_paths,
+        grad_output,
+        block_size=4,
+        max_logit=1e3,
+    )
+    stats = get_runtime_stats()
+    python_indices, python_attn, python_grad_log_probs = _prepare_non_causal_backward_python(
+        q,
+        k,
+        v,
+        packed_paths,
+        grad_output,
+        block_size=4,
+        max_logit=1e3,
+    )
+
+    assert stats["prepare_backward_native_calls"] > 0
+    assert stats["prepare_backward_python_calls"] == 0
+    assert torch.equal(native_indices, python_indices)
+    torch.testing.assert_close(native_attn, python_attn)
+    torch.testing.assert_close(native_grad_log_probs, python_grad_log_probs)
 
 
 def test_treeattn_cuda_native_sampler_matches_python() -> None:

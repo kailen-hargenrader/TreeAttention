@@ -15,6 +15,8 @@ _DEFAULT_MAX_LOGIT = 1e3
 _RUNTIME_STATS_TEMPLATE = {
     "sample_native_calls": 0,
     "sample_python_calls": 0,
+    "prepare_backward_native_calls": 0,
+    "prepare_backward_python_calls": 0,
     "replay_native_calls": 0,
     "replay_python_calls": 0,
     "weighted_value_native_calls": 0,
@@ -347,6 +349,87 @@ def _replay_non_causal_paths(
     )
 
 
+def _prepare_non_causal_backward_python(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    packed_paths: torch.Tensor,
+    grad_output: torch.Tensor,
+    *,
+    block_size: int,
+    max_logit: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    sampled_indices, path_log_probs = _replay_non_causal_paths_python(
+        q,
+        k,
+        packed_paths,
+        block_size=block_size,
+        max_logit=max_logit,
+    )
+    attn_weights = _softmax_path_log_probs_inplace(path_log_probs)
+    accum_dtype = _accum_dtype(v.dtype)
+    grad_attn = torch.empty_like(attn_weights)
+    v_accum = v.to(accum_dtype)
+    grad_output_accum = grad_output.to(accum_dtype)
+
+    for start in range(0, q.shape[0], block_size):
+        stop = min(start + block_size, q.shape[0])
+        gathered_values = _gather_tree_values(v_accum, sampled_indices[start:stop])
+        grad_attn[start:stop] = (
+            grad_output_accum[start:stop].unsqueeze(-2) * gathered_values
+        ).sum(dim=-1)
+
+    grad_log_probs = attn_weights * (
+        grad_attn - (attn_weights * grad_attn).sum(dim=-1, keepdim=True)
+    )
+    return sampled_indices, attn_weights, grad_log_probs
+
+
+def _prepare_non_causal_backward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    packed_paths: torch.Tensor,
+    grad_output: torch.Tensor,
+    *,
+    block_size: int,
+    max_logit: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if (
+        q.is_cuda
+        and k.is_cuda
+        and v.is_cuda
+        and packed_paths.is_cuda
+        and grad_output.is_cuda
+        and q.dtype == k.dtype == v.dtype == grad_output.dtype
+        and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and packed_paths.shape[3] <= 32
+        and k.shape[0] > 0
+    ):
+        native_result = _native.prepare_non_causal_backward(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            packed_paths.contiguous(),
+            grad_output.contiguous(),
+            max_logit,
+        )
+        if native_result is not None:
+            _note_runtime_usage("prepare_backward", native=True)
+            return native_result
+
+    _note_runtime_usage("prepare_backward", native=False)
+    return _prepare_non_causal_backward_python(
+        q,
+        k,
+        v,
+        packed_paths,
+        grad_output,
+        block_size=block_size,
+        max_logit=max_logit,
+    )
+
+
 def _weighted_value_sum(
     v: torch.Tensor,
     sampled_indices: torch.Tensor,
@@ -515,7 +598,7 @@ def _accumulate_qk_non_causal_all_depths_inplace(
         and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and grad_log_probs.dtype == torch.float32
         and grad_q_out.dtype == torch.float32
-        and grad_k_out.dtype in (q.dtype, torch.float32)
+        and grad_k_out.dtype == torch.float32
     ):
         used_native = _native.accumulate_qk_non_causal_all_depths_inplace(
             q.contiguous(),
@@ -631,14 +714,15 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
             _ensure_grad_v_accum()[0] = grad_output.to(accum_dtype).sum(dim=0)
             return grad_q, grad_k.to(k.dtype), grad_v.to(v.dtype), None, None, None
 
-        sampled_indices, path_log_probs = _replay_non_causal_paths(
+        sampled_indices, attn_weights, grad_log_probs = _prepare_non_causal_backward(
             q,
             k,
+            v,
             packed_paths,
+            grad_output,
             block_size=block_size,
             max_logit=max_logit,
         )
-        attn_weights = _softmax_path_log_probs_inplace(path_log_probs)
         grad_v_native = _scatter_weighted_grad_v(
             grad_output,
             sampled_indices,
@@ -647,6 +731,7 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
         )
         if grad_v_native is not None:
             grad_v = grad_v_native
+            attn_weights = None
         log_n = num_leaves.bit_length() - 1
         for start in range(0, q.shape[0], block_size):
             stop = min(start + block_size, q.shape[0])
@@ -654,15 +739,11 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
             grad_out_block = grad_output[start:stop]
             grad_out_block_accum = grad_out_block.to(accum_dtype)
             idx_block = sampled_indices[start:stop]
-            attn_block = attn_weights[start:stop]
-
-            gathered_values = _gather_tree_values(v, idx_block).to(accum_dtype)
-            grad_attn = (grad_out_block_accum.unsqueeze(-2) * gathered_values).sum(dim=-1)
-            grad_log_probs = attn_block * (
-                grad_attn - (attn_block * grad_attn).sum(dim=-1, keepdim=True)
-            )
+            grad_log_probs_block = grad_log_probs[start:stop]
 
             if grad_v_native is None:
+                assert attn_weights is not None
+                attn_block = attn_weights[start:stop]
                 grad_v_accum = _ensure_grad_v_accum()
                 grad_v_updates = attn_block.unsqueeze(-1) * grad_out_block_accum.unsqueeze(-2)
                 grad_v = grad_v_accum + _scatter_tree_updates(
@@ -674,7 +755,7 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
                 q_block,
                 k,
                 packed_paths[start:stop],
-                grad_log_probs,
+                grad_log_probs_block,
                 max_logit=max_logit,
                 grad_q_out=grad_q_block,
                 grad_k_out=grad_k,
@@ -690,7 +771,7 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
                         k_accum_local,
                         node_idx,
                         packed_paths[start:stop],
-                        grad_log_probs,
+                        grad_log_probs_block,
                         depth=depth,
                         max_logit=max_logit,
                         grad_q_out=grad_q_block,
@@ -702,7 +783,7 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
                             k_accum_local,
                             node_idx,
                             packed_paths[start:stop],
-                            grad_log_probs,
+                            grad_log_probs_block,
                             depth=depth,
                             max_logit=max_logit,
                         )

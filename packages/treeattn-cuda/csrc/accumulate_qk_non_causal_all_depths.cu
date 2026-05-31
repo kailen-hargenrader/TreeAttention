@@ -23,8 +23,105 @@ int64_t compute_log_n_host(int64_t num_leaves) {
   }
   return log_n;
 }
+
+__device__ __forceinline__ float warp_reduce_sum(float value) {
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value += __shfl_down_sync(0xffffffffU, value, offset);
+  }
+  return __shfl_sync(0xffffffffU, value, 0);
+}
+
 template <typename scalar_t, typename acc_t>
-__global__ void accumulate_qk_non_causal_all_depths_inplace_kernel(
+__global__ void accumulate_qk_non_causal_all_depths_query_tiled_kernel(
+  const scalar_t* __restrict__ q,
+  const scalar_t* __restrict__ k,
+    const uint8_t* __restrict__ packed_paths,
+    const float* __restrict__ grad_log_probs,
+    float* __restrict__ grad_q_out,
+    float* __restrict__ grad_k_out,
+    int64_t batch,
+    int64_t nheads,
+    int64_t width,
+    int64_t num_queries,
+    int64_t num_samples,
+    int64_t path_bytes,
+    int64_t log_n,
+    float max_logit) {
+  extern __shared__ float shared[];
+  float* q_shared = shared;
+  float* grad_q_partials = q_shared + width;
+
+  const int lane = threadIdx.x & 31;
+  const int warp_id = threadIdx.x >> 5;
+  const int64_t qbh_idx = static_cast<int64_t>(blockIdx.x);
+  const int64_t total_qbh = num_queries * batch * nheads;
+  if (qbh_idx >= total_qbh) {
+    return;
+  }
+
+  int64_t tmp = qbh_idx;
+  const int64_t head_idx = tmp % nheads;
+  tmp /= nheads;
+  const int64_t batch_idx = tmp % batch;
+  const int64_t query_idx = tmp / batch;
+
+  const int64_t q_offset = (((query_idx * batch) + batch_idx) * nheads + head_idx) * width;
+  for (int64_t d = threadIdx.x; d < width; d += blockDim.x) {
+    q_shared[d] = static_cast<float>(q[q_offset + d]);
+  }
+  for (int64_t idx = threadIdx.x; idx < num_samples * width; idx += blockDim.x) {
+    grad_q_partials[idx] = 0.0f;
+  }
+  __syncthreads();
+
+  const int64_t sample_idx = warp_id;
+  const int64_t sample_offset = qbh_idx * num_samples + sample_idx;
+  const int64_t packed_offset = sample_offset * path_bytes;
+  const float sample_grad_log_probs = grad_log_probs[sample_offset];
+
+  int64_t node_idx = 0;
+  for (int64_t depth = 0; depth < log_n; ++depth) {
+    int64_t bit = 0;
+    if (lane == 0) {
+      const uint8_t packed_byte = packed_paths[packed_offset + (depth >> 3)];
+      bit = static_cast<int64_t>((packed_byte >> (depth & 7)) & 1U);
+    }
+    bit = __shfl_sync(0xffffffffU, bit, 0);
+    const float branch_sign = bit == 0 ? 1.0f : -1.0f;
+    const int64_t k_offset = (((node_idx * batch) + batch_idx) * nheads + head_idx) * width;
+
+    float dot_partial = 0.0f;
+    for (int64_t d = lane; d < width; d += 32) {
+      dot_partial += q_shared[d] * static_cast<float>(k[k_offset + d]);
+    }
+    float dot = warp_reduce_sum(dot_partial);
+    if (dot > max_logit) {
+      dot = max_logit;
+    } else if (dot < -max_logit) {
+      dot = -max_logit;
+    }
+
+    const float grad_logit = branch_sign * sigmoid_forward(-branch_sign * dot) * sample_grad_log_probs;
+    for (int64_t d = lane; d < width; d += 32) {
+      grad_q_partials[warp_id * width + d] += grad_logit * static_cast<float>(k[k_offset + d]);
+      atomicAdd(grad_k_out + k_offset + d, grad_logit * q_shared[d]);
+    }
+
+    node_idx = 2 * node_idx + 1 + bit;
+  }
+
+  __syncthreads();
+  for (int64_t d = threadIdx.x; d < width; d += blockDim.x) {
+    float grad_q = 0.0f;
+    for (int64_t sample = 0; sample < num_samples; ++sample) {
+      grad_q += grad_q_partials[sample * width + d];
+    }
+    grad_q_out[q_offset + d] = grad_q;
+  }
+}
+
+template <typename scalar_t, typename acc_t>
+__global__ void accumulate_qk_non_causal_all_depths_sample_threaded_kernel(
   const scalar_t* __restrict__ q,
   const scalar_t* __restrict__ k,
     const uint8_t* __restrict__ packed_paths,
@@ -68,7 +165,8 @@ __global__ void accumulate_qk_non_causal_all_depths_inplace_kernel(
 
     acc_t dot = static_cast<acc_t>(0);
     for (int64_t d = 0; d < width; ++d) {
-      dot += static_cast<acc_t>(q[q_offset + d]) * static_cast<acc_t>(k[k_offset + d]);
+  const float q_val = static_cast<float>(q[q_offset + d]);
+      dot += static_cast<acc_t>(q_val) * static_cast<acc_t>(k[k_offset + d]);
     }
     const acc_t max_logit_acc = static_cast<acc_t>(max_logit);
     if (dot > max_logit_acc) {
@@ -79,8 +177,9 @@ __global__ void accumulate_qk_non_causal_all_depths_inplace_kernel(
 
     const float grad_logit = branch_sign * sigmoid_forward(-branch_sign * static_cast<float>(dot)) * sample_grad_log_probs;
     for (int64_t d = 0; d < width; ++d) {
-      atomicAdd(grad_q_out + q_offset + d, grad_logit * static_cast<float>(k[k_offset + d]));
-      atomicAdd(grad_k_out + k_offset + d, grad_logit * static_cast<float>(q[q_offset + d]));
+  atomicAdd(grad_q_out + q_offset + d, grad_logit * static_cast<float>(k[k_offset + d]));
+  const float q_val = static_cast<float>(q[q_offset + d]);
+  atomicAdd(grad_k_out + k_offset + d, grad_logit * q_val);
     }
 
     node_idx = 2 * node_idx + 1 + bit;
@@ -108,7 +207,35 @@ void launch_accumulate_qk_non_causal_all_depths_inplace_kernel(
     float max_logit,
     int blocks,
     int threads) {
-  accumulate_qk_non_causal_all_depths_inplace_kernel<scalar_t, acc_t><<<
+  constexpr int64_t max_query_tiled_samples = 8;
+  constexpr int64_t max_query_tiled_width = 128;
+  if (num_samples <= max_query_tiled_samples && width <= max_query_tiled_width) {
+    const int query_tiled_threads = static_cast<int>(num_samples * 32);
+    const int query_tiled_blocks = static_cast<int>(num_queries * batch * nheads);
+    const size_t shared_bytes = static_cast<size_t>((num_samples + 1) * width) * sizeof(float);
+    accumulate_qk_non_causal_all_depths_query_tiled_kernel<scalar_t, acc_t><<<
+        query_tiled_blocks,
+        query_tiled_threads,
+        shared_bytes,
+        at::cuda::getDefaultCUDAStream()>>>(
+        q.data_ptr<scalar_t>(),
+        k.data_ptr<scalar_t>(),
+        packed_paths.data_ptr<uint8_t>(),
+        grad_log_probs.data_ptr<float>(),
+        grad_q_out.data_ptr<float>(),
+        grad_k_out.data_ptr<float>(),
+        batch,
+        nheads,
+        width,
+        num_queries,
+        num_samples,
+        path_bytes,
+        log_n,
+        max_logit);
+    return;
+  }
+
+  accumulate_qk_non_causal_all_depths_sample_threaded_kernel<scalar_t, acc_t><<<
       blocks,
       threads,
       0,
