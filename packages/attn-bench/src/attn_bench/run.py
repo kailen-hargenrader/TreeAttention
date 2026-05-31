@@ -60,6 +60,61 @@ def _flag_name(baseline: str) -> str:
     return "--" + baseline.replace("_", "-")
 
 
+def _env_snapshot(*names: str) -> dict[str, str | None]:
+    out: dict[str, str | None] = {}
+    for name in names:
+        raw = _os.environ.get(name)
+        out[name] = raw if raw not in (None, "") else None
+    return out
+
+
+def _treeattn_cuda_runtime() -> dict[str, object]:
+    runtime: dict[str, object] = {
+        "env": _env_snapshot(
+            "TREEATTN_NUM_SAMPLES",
+            "TREEATTN_CUDA_BUILD",
+            "TREEATTN_CUDA_VERBOSE",
+            "TORCH_CUDA_ARCH_LIST",
+        )
+    }
+    try:
+        import treeattn_cuda as t
+
+        runtime["import_ok"] = True
+        runtime["has_native_kernels"] = bool(t.has_native_kernels())
+    except Exception as e:
+        runtime["import_ok"] = False
+        runtime["import_error"] = f"{type(e).__name__}: {e}"
+    return runtime
+
+
+def _treeattn_jax_runtime() -> dict[str, object]:
+    runtime: dict[str, object] = {
+        "env": _env_snapshot(
+            "TREEATTN_NUM_SAMPLES",
+            "XLA_PYTHON_CLIENT_PREALLOCATE",
+        )
+    }
+    try:
+        import treeattn_jax  # noqa: F401
+
+        runtime["import_ok"] = True
+    except Exception as e:
+        runtime["import_ok"] = False
+        runtime["import_error"] = f"{type(e).__name__}: {e}"
+    return runtime
+
+
+def _adapter_runtime_metadata(adapter: KernelAdapter) -> dict[str, object]:
+    if adapter.name == "treeattn_cuda":
+        return _treeattn_cuda_runtime()
+    if adapter.name == "treeattn_jax":
+        return _treeattn_jax_runtime()
+    if adapter.name == "treeattn_torch":
+        return {"env": _env_snapshot("TREEATTN_NUM_SAMPLES")}
+    return {}
+
+
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="attn-bench",
@@ -171,6 +226,50 @@ def main(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     device_name = torch.cuda.get_device_name(0)
+    adapter_meta = []
+    for a in adapters:
+        runtime = _adapter_runtime_metadata(a)
+        entry = {
+            "name": a.name,
+            "allowed_dtypes": [dtype_str(d) for d in a.allowed_dtypes],
+            "allowed_head_dims": sorted(a.allowed_head_dims),
+            "supports_backward": a.supports_backward,
+            "supports_causal": a.supports_causal,
+        }
+        if runtime:
+            entry["runtime"] = runtime
+        adapter_meta.append(entry)
+
+    for entry in adapter_meta:
+        if entry["name"] != "treeattn_cuda":
+            continue
+        runtime = entry.get("runtime", {})
+        if not isinstance(runtime, dict):
+            continue
+        if runtime.get("import_ok") is False:
+            print(
+                "[warn] treeattn_cuda import failed during runtime probe; "
+                "benchmark cells may fail or fall back unexpectedly.",
+                file=sys.stderr,
+            )
+            continue
+        if runtime.get("has_native_kernels") is True:
+            continue
+        env = runtime.get("env", {})
+        build_requested = isinstance(env, dict) and env.get("TREEATTN_CUDA_BUILD") == "1"
+        if build_requested:
+            print(
+                "[warn] treeattn_cuda native kernels were requested but are not available; "
+                "benchmark results will use the Python/Torch fallback path.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "[warn] treeattn_cuda native kernels are not enabled; "
+                "set TREEATTN_CUDA_BUILD=1 to benchmark the compiled CUDA path.",
+                file=sys.stderr,
+            )
+
     meta = {
         "run_id": run_id,
         "device": device_name,
@@ -178,17 +277,17 @@ def main(argv: list[str] | None = None) -> int:
         "cuda": torch.version.cuda,
         "warmup": args.warmup,
         "iters": args.iters,
+        "seed": args.seed,
         "do_backward": not args.no_backward,
-        "adapters": [
-            {
-                "name": a.name,
-                "allowed_dtypes": [dtype_str(d) for d in a.allowed_dtypes],
-                "allowed_head_dims": sorted(a.allowed_head_dims),
-                "supports_backward": a.supports_backward,
-                "supports_causal": a.supports_causal,
-            }
-            for a in adapters
-        ],
+        "isolate": args.isolate,
+        "env": _env_snapshot(
+            "TREEATTN_NUM_SAMPLES",
+            "TREEATTN_CUDA_BUILD",
+            "TREEATTN_CUDA_VERBOSE",
+            "TORCH_CUDA_ARCH_LIST",
+            "XLA_PYTHON_CLIENT_PREALLOCATE",
+        ),
+        "adapters": adapter_meta,
         "sweep": [c.to_dict() for c in sweep],
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))

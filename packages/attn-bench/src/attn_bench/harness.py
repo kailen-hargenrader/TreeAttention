@@ -36,6 +36,40 @@ torch.backends.cudnn.benchmark = False
 torch.set_float32_matmul_precision("highest")
 
 
+def _treeattn_cuda_runtime_hooks(adapter: KernelAdapter):
+    if adapter.name != "treeattn_cuda":
+        return None, None
+    try:
+        import treeattn_cuda as t
+    except Exception:
+        return None, None
+    reset = getattr(t, "reset_runtime_stats", None)
+    get = getattr(t, "get_runtime_stats", None)
+    if callable(reset) and callable(get):
+        return reset, get
+    return None, None
+
+
+def _record_treeattn_cuda_phase_stats(
+    dest: dict,
+    prefix: str,
+    stats: dict[str, int],
+) -> None:
+    if not stats:
+        return
+    used_native_any = False
+    used_python_any = False
+    for key, value in stats.items():
+        scalar_value = int(value)
+        dest[f"{prefix}_{key}"] = scalar_value
+        if key.endswith("_native_calls") and scalar_value > 0:
+            used_native_any = True
+        if key.endswith("_python_calls") and scalar_value > 0:
+            used_python_any = True
+    dest[f"{prefix}_used_native_any"] = used_native_any
+    dest[f"{prefix}_used_python_any"] = used_python_any
+
+
 @dataclass
 class TimingStats:
     median_ms: float
@@ -120,6 +154,9 @@ class Result:
             row["error_msg"] = self.error_msg
         if self.skip_reason:
             row["skip_reason"] = self.skip_reason
+        for key, value in self.extra.items():
+            if isinstance(value, (bool, int, float, str)):
+                row[key] = value
         return row
 
 
@@ -303,6 +340,9 @@ def time_kernel(
         q, k, v, grad_out = _make_inputs(cfg, requires_grad=want_bwd, seed=seed)
         validate_inputs(adapter, q, k, v, cfg.dtype)
 
+        result_extra: dict[str, bool | int | float | str] = {}
+        treeattn_cuda_reset, treeattn_cuda_get = _treeattn_cuda_runtime_hooks(adapter)
+
         softmax_scale = 1.0 / (cfg.head_dim ** 0.5)
         pre_ptrs = _ptr_snapshot(q, k, v)
 
@@ -314,6 +354,8 @@ def time_kernel(
             with torch.no_grad():
                 _ = adapter.fn(q, k, v, cfg.causal, softmax_scale)
 
+        if treeattn_cuda_reset is not None:
+            treeattn_cuda_reset()
         _warmup_with_leak_check(
             fwd_inference, warmup,
             on_leak=_on_leak("fwd_inference"),
@@ -321,6 +363,12 @@ def time_kernel(
         )
         fwd_inf_samples = _time_iters(fwd_inference, iters)
         fwd_inf_stats = TimingStats.from_samples(fwd_inf_samples)
+        if treeattn_cuda_get is not None:
+            _record_treeattn_cuda_phase_stats(
+                result_extra,
+                "treeattn_cuda_fwd",
+                treeattn_cuda_get(),
+            )
         check_no_inplace(pre_ptrs, (q, k, v))
         fwd_inf_tf = tflops_per_sec(fwd_flops_val, fwd_inf_stats.median_ms)
 
@@ -338,6 +386,8 @@ def time_kernel(
                 out = adapter.fn(q, k, v, cfg.causal, softmax_scale)
                 out.backward(grad_out)
 
+            if treeattn_cuda_reset is not None:
+                treeattn_cuda_reset()
             _warmup_with_leak_check(
                 step, warmup,
                 on_leak=_on_leak("step"),
@@ -345,6 +395,12 @@ def time_kernel(
             )
             step_samples = _time_iters(step, iters)
             step_stats = TimingStats.from_samples(step_samples)
+            if treeattn_cuda_get is not None:
+                _record_treeattn_cuda_phase_stats(
+                    result_extra,
+                    "treeattn_cuda_step",
+                    treeattn_cuda_get(),
+                )
             step_tf = tflops_per_sec(fwd_flops_val + bwd_flops_val, step_stats.median_ms)
 
         # ===== memory pass (untimed): three independent probes =====
@@ -400,6 +456,7 @@ def time_kernel(
             fwd_peak_mem_mb=fwd_peak_mb,
             fwd_saved_mem_mb=fwd_saved_mb,
             bwd_peak_mem_mb=bwd_peak_mb,
+            extra=result_extra,
         )
 
     except torch.cuda.OutOfMemoryError as e:

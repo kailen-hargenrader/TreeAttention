@@ -12,6 +12,37 @@ from treeattn_torch import hierarchical_attention as reference_hierarchical_atte
 Mode = Literal["deterministic", "stochastic"]
 _DEFAULT_BLOCK_SIZE = 256
 _DEFAULT_MAX_LOGIT = 1e3
+_RUNTIME_STATS_TEMPLATE = {
+    "sample_native_calls": 0,
+    "sample_python_calls": 0,
+    "replay_native_calls": 0,
+    "replay_python_calls": 0,
+    "weighted_value_native_calls": 0,
+    "weighted_value_python_calls": 0,
+    "scatter_grad_v_native_calls": 0,
+    "scatter_grad_v_python_calls": 0,
+    "grad_logit_native_calls": 0,
+    "grad_logit_python_calls": 0,
+    "accumulate_qk_native_calls": 0,
+    "accumulate_qk_python_calls": 0,
+    "accumulate_qk_all_depths_native_calls": 0,
+    "accumulate_qk_all_depths_python_calls": 0,
+}
+_RUNTIME_STATS = dict(_RUNTIME_STATS_TEMPLATE)
+
+
+def reset_runtime_stats() -> None:
+    _RUNTIME_STATS.clear()
+    _RUNTIME_STATS.update(_RUNTIME_STATS_TEMPLATE)
+
+
+def get_runtime_stats() -> dict[str, int]:
+    return dict(_RUNTIME_STATS)
+
+
+def _note_runtime_usage(op: str, *, native: bool) -> None:
+    suffix = "native_calls" if native else "python_calls"
+    _RUNTIME_STATS[f"{op}_{suffix}"] += 1
 
 
 def has_native_kernels() -> bool:
@@ -38,7 +69,7 @@ def _path_bit_bytes(num_leaves: int) -> int:
 def _read_path_bit(packed_paths: torch.Tensor, depth: int) -> torch.Tensor:
     byte_idx = depth // 8
     bit_offset = depth % 8
-    return ((packed_paths[..., byte_idx] >> bit_offset) & 1).to(torch.int64)
+    return ((packed_paths[..., byte_idx] >> bit_offset) & 1).to(torch.int32)
 
 
 def _empty_packed_paths(
@@ -73,7 +104,7 @@ def _gather_tree_values(tree: torch.Tensor, indices: torch.Tensor) -> torch.Tens
         tree_view = tree_view.unsqueeze(0)
     tree_expanded = tree_view.expand(*leading_shape, batch, nheads, t_len, width)
 
-    safe_indices = indices.clamp(0, t_len - 1)
+    safe_indices = indices.to(torch.int64).clamp(0, t_len - 1)
     gather_index = safe_indices.unsqueeze(-1).expand(*safe_indices.shape, width)
     return torch.gather(tree_expanded, dim=-2, index=gather_index)
 
@@ -90,7 +121,10 @@ def _scatter_tree_updates(num_nodes: int, indices: torch.Tensor, updates: torch.
     _, batch, nheads, _, width = updates.shape
     out = updates.new_zeros((batch, nheads, num_nodes, width))
     flat_indices = (
-        indices.permute(1, 2, 0, 3).contiguous().reshape(batch, nheads, -1, 1)
+        indices.to(torch.int64)
+        .permute(1, 2, 0, 3)
+        .contiguous()
+        .reshape(batch, nheads, -1, 1)
     )
     flat_indices = flat_indices.expand(batch, nheads, flat_indices.shape[2], width)
     flat_updates = (
@@ -114,7 +148,7 @@ def _sample_paths_non_causal_streaming_python(
     num_leaves = k_len + 1
     if k_len == 0:
         sampled = torch.zeros(
-            (l_q, batch, nheads, num_samples), device=q.device, dtype=torch.int64
+            (l_q, batch, nheads, num_samples), device=q.device, dtype=torch.int32
         )
         log_probs = torch.zeros(
             (l_q, batch, nheads, num_samples),
@@ -133,7 +167,7 @@ def _sample_paths_non_causal_streaming_python(
     log_n = num_leaves.bit_length() - 1
     path_bytes = _path_bit_bytes(num_leaves)
     current_nodes = torch.zeros(
-        (l_q, batch, nheads, num_samples), device=q.device, dtype=torch.int64
+        (l_q, batch, nheads, num_samples), device=q.device, dtype=torch.int32
     )
     accumulated_log_probs = torch.zeros(
         (l_q, batch, nheads, num_samples), device=q.device, dtype=accum_dtype
@@ -176,9 +210,10 @@ def _sample_paths_non_causal_streaming_python(
             packed_paths[start:stop, ..., depth // 8].bitwise_or_(
                 directions.to(torch.uint8) << (depth % 8)
             )
-            current_nodes[start:stop] = 2 * node_block + 1 + directions.to(torch.int64)
+            current_nodes[start:stop] = 2 * node_block + 1 + directions.to(torch.int32)
 
-    return current_nodes - k_len, accumulated_log_probs, packed_paths
+    current_nodes.sub_(k_len)
+    return current_nodes, accumulated_log_probs, packed_paths
 
 
 def _sample_paths_non_causal_streaming(
@@ -192,8 +227,8 @@ def _sample_paths_non_causal_streaming(
     if (
         q.is_cuda
         and k.is_cuda
-        and q.dtype == torch.float32
-        and k.dtype == torch.float32
+        and q.dtype == k.dtype
+        and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and k.shape[0] > 0
     ):
         native_result = _native.sample_non_causal_paths_forward(
@@ -205,8 +240,10 @@ def _sample_paths_non_causal_streaming(
         )
         if native_result is not None:
             sampled_indices, path_log_probs, packed_paths = native_result
+            _note_runtime_usage("sample", native=True)
             return sampled_indices, path_log_probs, packed_paths
 
+    _note_runtime_usage("sample", native=False)
     return _sample_paths_non_causal_streaming_python(
         q,
         k,
@@ -242,7 +279,7 @@ def _replay_non_causal_paths_python(
     accum_dtype = _accum_dtype(q.dtype)
     log_n = num_leaves.bit_length() - 1
     current_nodes = torch.zeros(
-        (l_q, batch, nheads, num_samples), device=q.device, dtype=torch.int64
+        (l_q, batch, nheads, num_samples), device=q.device, dtype=torch.int32
     )
     accumulated_log_probs = torch.zeros(
         (l_q, batch, nheads, num_samples), device=q.device, dtype=accum_dtype
@@ -269,7 +306,8 @@ def _replay_non_causal_paths_python(
             )
             current_nodes[start:stop] = 2 * node_block + 1 + directions
 
-    return current_nodes - k_len, accumulated_log_probs
+    current_nodes.sub_(k_len)
+    return current_nodes, accumulated_log_probs
 
 
 def _replay_non_causal_paths(
@@ -284,8 +322,8 @@ def _replay_non_causal_paths(
         q.is_cuda
         and k.is_cuda
         and packed_paths.is_cuda
-        and q.dtype == torch.float32
-        and k.dtype == torch.float32
+        and q.dtype == k.dtype
+        and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and k.shape[0] > 0
     ):
         native_result = _native.replay_non_causal_paths_forward(
@@ -296,8 +334,10 @@ def _replay_non_causal_paths(
         )
         if native_result is not None:
             sampled_indices, path_log_probs = native_result
+            _note_runtime_usage("replay", native=True)
             return sampled_indices, path_log_probs
 
+    _note_runtime_usage("replay", native=False)
     return _replay_non_causal_paths_python(
         q,
         k,
@@ -321,6 +361,7 @@ def _weighted_value_sum(
             attn_weights.to(torch.float32).contiguous(),
         )
         if native_output is not None:
+            _note_runtime_usage("weighted_value", native=True)
             return native_output
 
     l_q, batch, nheads, _ = sampled_indices.shape
@@ -337,7 +378,14 @@ def _weighted_value_sum(
         output[start:stop] = (
             weights_accum[start:stop].unsqueeze(-1) * gathered_values
         ).sum(dim=-2)
+    _note_runtime_usage("weighted_value", native=False)
     return output.to(v.dtype)
+
+
+def _softmax_path_log_probs_inplace(path_log_probs: torch.Tensor) -> torch.Tensor:
+    path_log_probs.sub_(torch.logsumexp(path_log_probs, dim=-1, keepdim=True))
+    path_log_probs.exp_()
+    return path_log_probs
 
 
 def _scatter_weighted_grad_v(
@@ -361,7 +409,9 @@ def _scatter_weighted_grad_v(
             num_leaves,
         )
         if native_output is not None:
+            _note_runtime_usage("scatter_grad_v", native=True)
             return native_output
+    _note_runtime_usage("scatter_grad_v", native=False)
     return None
 
 
@@ -381,8 +431,8 @@ def _compute_grad_logit_non_causal(
         and current_nodes.is_cuda
         and packed_paths.is_cuda
         and grad_log_probs.is_cuda
-        and q.dtype == torch.float32
-        and k.dtype == torch.float32
+        and q.dtype == k.dtype
+        and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and grad_log_probs.dtype == torch.float32
     ):
         native_output = _native.compute_grad_logit_non_causal_forward(
@@ -395,7 +445,9 @@ def _compute_grad_logit_non_causal(
             max_logit,
         )
         if native_output is not None:
+            _note_runtime_usage("grad_logit", native=True)
             return native_output
+    _note_runtime_usage("grad_logit", native=False)
     return None
 
 
@@ -419,13 +471,13 @@ def _accumulate_qk_non_causal_inplace(
         and grad_log_probs.is_cuda
         and grad_q_out.is_cuda
         and grad_k_out.is_cuda
-        and q.dtype == torch.float32
-        and k.dtype == torch.float32
+        and q.dtype == k.dtype
+        and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and grad_log_probs.dtype == torch.float32
         and grad_q_out.dtype == torch.float32
         and grad_k_out.dtype == torch.float32
     ):
-        return _native.accumulate_qk_non_causal_inplace(
+        used_native = _native.accumulate_qk_non_causal_inplace(
             q.contiguous(),
             k.contiguous(),
             current_nodes.contiguous(),
@@ -436,6 +488,9 @@ def _accumulate_qk_non_causal_inplace(
             grad_q_out,
             grad_k_out,
         )
+        _note_runtime_usage("accumulate_qk", native=used_native)
+        return used_native
+    _note_runtime_usage("accumulate_qk", native=False)
     return False
 
 
@@ -456,13 +511,13 @@ def _accumulate_qk_non_causal_all_depths_inplace(
         and grad_log_probs.is_cuda
         and grad_q_out.is_cuda
         and grad_k_out.is_cuda
-        and q.dtype == torch.float32
-        and k.dtype == torch.float32
+        and q.dtype == k.dtype
+        and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and grad_log_probs.dtype == torch.float32
         and grad_q_out.dtype == torch.float32
         and grad_k_out.dtype == torch.float32
     ):
-        return _native.accumulate_qk_non_causal_all_depths_inplace(
+        used_native = _native.accumulate_qk_non_causal_all_depths_inplace(
             q.contiguous(),
             k.contiguous(),
             packed_paths.contiguous(),
@@ -471,6 +526,9 @@ def _accumulate_qk_non_causal_all_depths_inplace(
             grad_q_out,
             grad_k_out,
         )
+        _note_runtime_usage("accumulate_qk_all_depths", native=used_native)
+        return used_native
+    _note_runtime_usage("accumulate_qk_all_depths", native=False)
     return False
 
 
@@ -521,7 +579,7 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
             block_size=block_size,
             max_logit=max_logit,
         )
-        attn_weights = torch.softmax(path_log_probs, dim=-1)
+        attn_weights = _softmax_path_log_probs_inplace(path_log_probs)
         output = _weighted_value_sum(
             v,
             sampled_indices,
@@ -545,14 +603,22 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
         num_leaves = v.shape[0]
         k_len = k.shape[0]
         accum_dtype = _accum_dtype(q.dtype)
-        q_accum = q.to(accum_dtype)
-        k_accum = k.to(accum_dtype)
         v_accum = v.to(accum_dtype)
         grad_out_accum = grad_output.to(accum_dtype)
+        q_accum: torch.Tensor | None = None
+        k_accum: torch.Tensor | None = None
 
-        grad_q = torch.zeros_like(q_accum)
-        grad_k = torch.zeros_like(k_accum)
+        grad_q = torch.zeros_like(q, dtype=accum_dtype)
+        grad_k = torch.zeros_like(k, dtype=accum_dtype)
         grad_v = torch.zeros_like(v_accum)
+
+        def _ensure_qk_accum() -> tuple[torch.Tensor, torch.Tensor]:
+            nonlocal q_accum, k_accum
+            if q_accum is None:
+                q_accum = q.to(accum_dtype)
+            if k_accum is None:
+                k_accum = k.to(accum_dtype)
+            return q_accum, k_accum
 
         if num_leaves == 0:
             return grad_q.to(q.dtype), grad_k.to(k.dtype), grad_v.to(v.dtype), None, None, None
@@ -562,13 +628,13 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
             return grad_q.to(q.dtype), grad_k.to(k.dtype), grad_v.to(v.dtype), None, None, None
 
         sampled_indices, path_log_probs = _replay_non_causal_paths(
-            q_accum,
-            k_accum,
+            q,
+            k,
             packed_paths,
             block_size=block_size,
             max_logit=max_logit,
         )
-        attn_weights = torch.softmax(path_log_probs, dim=-1)
+        attn_weights = _softmax_path_log_probs_inplace(path_log_probs)
         grad_v_native = _scatter_weighted_grad_v(
             grad_out_accum,
             sampled_indices,
@@ -580,7 +646,7 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
         log_n = num_leaves.bit_length() - 1
         for start in range(0, q.shape[0], block_size):
             stop = min(start + block_size, q.shape[0])
-            q_block = q_accum[start:stop]
+            q_block = q[start:stop]
             grad_out_block = grad_out_accum[start:stop]
             idx_block = sampled_indices[start:stop]
             attn_block = attn_weights[start:stop]
@@ -597,10 +663,10 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
                     num_leaves, idx_block, grad_v_updates
                 )
 
-            grad_q_block = torch.zeros_like(q_block)
+            grad_q_block = torch.zeros_like(grad_out_block)
             used_full_native_qk = _accumulate_qk_non_causal_all_depths_inplace(
                 q_block,
-                k_accum,
+                k,
                 packed_paths[start:stop],
                 grad_log_probs,
                 max_logit=max_logit,
@@ -608,12 +674,14 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
                 grad_k_out=grad_k,
             )
             if not used_full_native_qk:
+                q_accum_local, k_accum_local = _ensure_qk_accum()
+                q_block_accum = q_accum_local[start:stop]
                 node_idx = torch.zeros_like(idx_block)
                 for depth in range(log_n):
                     bit = _read_path_bit(packed_paths[start:stop], depth)
                     used_native_qk = _accumulate_qk_non_causal_inplace(
-                        q_block,
-                        k_accum,
+                        q_block_accum,
+                        k_accum_local,
                         node_idx,
                         packed_paths[start:stop],
                         grad_log_probs,
@@ -624,8 +692,8 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
                     )
                     if not used_native_qk:
                         grad_logit = _compute_grad_logit_non_causal(
-                            q_block,
-                            k_accum,
+                            q_block_accum,
+                            k_accum_local,
                             node_idx,
                             packed_paths[start:stop],
                             grad_log_probs,
@@ -634,8 +702,8 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
                         )
                     if not used_native_qk and grad_logit is None:
                         branch_sign = torch.where(bit == 0, 1.0, -1.0).to(accum_dtype)
-                        gathered_keys = _gather_tree_values(k_accum, node_idx)
-                        logits = (q_block.unsqueeze(-2) * gathered_keys).sum(dim=-1)
+                        gathered_keys = _gather_tree_values(k_accum_local, node_idx)
+                        logits = (q_block_accum.unsqueeze(-2) * gathered_keys).sum(dim=-1)
                         logits = logits.clamp(min=-max_logit, max=max_logit)
                         grad_logit = branch_sign * torch.sigmoid(-branch_sign * logits)
                         grad_logit = grad_logit * grad_log_probs
@@ -643,20 +711,20 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
                         grad_q_block = grad_q_block + (
                             grad_logit.unsqueeze(-1) * gathered_keys
                         ).sum(dim=-2)
-                        grad_k_updates = grad_logit.unsqueeze(-1) * q_block.unsqueeze(-2)
+                        grad_k_updates = grad_logit.unsqueeze(-1) * q_block_accum.unsqueeze(-2)
                         grad_k = grad_k + _scatter_tree_updates(
                             k_len, node_idx, grad_k_updates
                         )
                     elif not used_native_qk:
                         grad_q_contrib = _weighted_value_sum(
-                            k_accum,
+                            k_accum_local,
                             node_idx,
                             grad_logit,
                             block_size=block_size,
                         )
                         grad_q_block = grad_q_block + grad_q_contrib
                         grad_k_contrib = _scatter_weighted_grad_v(
-                            q_block,
+                            q_block_accum,
                             node_idx,
                             grad_logit,
                             num_leaves=k_len,

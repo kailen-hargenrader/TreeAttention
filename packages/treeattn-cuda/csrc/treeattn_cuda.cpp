@@ -2,6 +2,19 @@
 
 #include <tuple>
 
+namespace {
+
+bool is_supported_treeattn_dtype(torch::ScalarType dtype) {
+  return dtype == torch::kFloat32 || dtype == torch::kFloat16 ||
+         dtype == torch::kBFloat16;
+}
+
+bool is_supported_treeattn_index_dtype(torch::ScalarType dtype) {
+  return dtype == torch::kInt32 || dtype == torch::kInt64;
+}
+
+}  // namespace
+
 torch::Tensor weighted_value_sum_forward_cuda(
     const torch::Tensor& v,
     const torch::Tensor& sampled_indices,
@@ -69,7 +82,9 @@ torch::Tensor weighted_value_sum_forward(
   TORCH_CHECK(v.dim() == 4, "v must have shape (N, B, H, D)");
   TORCH_CHECK(sampled_indices.dim() == 4, "sampled_indices must have shape (L, B, H, S)");
   TORCH_CHECK(attn_weights.dim() == 4, "attn_weights must have shape (L, B, H, S)");
-  TORCH_CHECK(sampled_indices.scalar_type() == torch::kInt64, "sampled_indices must be int64");
+  TORCH_CHECK(
+      is_supported_treeattn_index_dtype(sampled_indices.scalar_type()),
+      "sampled_indices must be int32 or int64");
   TORCH_CHECK(attn_weights.scalar_type() == torch::kFloat32, "attn_weights must be float32");
   TORCH_CHECK(sampled_indices.sizes() == attn_weights.sizes(), "sampled_indices and attn_weights must have the same shape");
   TORCH_CHECK(v.size(1) == sampled_indices.size(1), "batch dimensions must match");
@@ -91,8 +106,10 @@ sample_non_causal_paths_forward(
   TORCH_CHECK(k.is_contiguous(), "k must be contiguous");
   TORCH_CHECK(q.dim() == 4, "q must have shape (L, B, H, D)");
   TORCH_CHECK(k.dim() == 4, "k must have shape (K, B, H, D)");
-  TORCH_CHECK(q.scalar_type() == torch::kFloat32, "q must be float32");
-  TORCH_CHECK(k.scalar_type() == torch::kFloat32, "k must be float32");
+  TORCH_CHECK(q.scalar_type() == k.scalar_type(), "q and k must have the same dtype");
+  TORCH_CHECK(
+      is_supported_treeattn_dtype(q.scalar_type()),
+      "q and k must be float32, float16, or bfloat16");
   TORCH_CHECK(k.size(0) > 0, "sample_non_causal_paths_forward expects K > 0");
   TORCH_CHECK(num_samples > 0, "num_samples must be > 0");
   TORCH_CHECK(block_size > 0, "block_size must be > 0");
@@ -119,8 +136,10 @@ std::tuple<torch::Tensor, torch::Tensor> replay_non_causal_paths_forward(
   TORCH_CHECK(
       packed_paths.dim() == 5,
       "packed_paths must have shape (L, B, H, S, P)");
-  TORCH_CHECK(q.scalar_type() == torch::kFloat32, "q must be float32");
-  TORCH_CHECK(k.scalar_type() == torch::kFloat32, "k must be float32");
+    TORCH_CHECK(q.scalar_type() == k.scalar_type(), "q and k must have the same dtype");
+    TORCH_CHECK(
+      is_supported_treeattn_dtype(q.scalar_type()),
+      "q and k must be float32, float16, or bfloat16");
   TORCH_CHECK(
       packed_paths.scalar_type() == torch::kUInt8,
       "packed_paths must be uint8");
@@ -151,7 +170,9 @@ torch::Tensor scatter_weighted_grad_v_forward(
   TORCH_CHECK(attn_weights.dim() == 4, "attn_weights must have shape (L, B, H, S)");
   TORCH_CHECK(grad_output.scalar_type() == torch::kFloat32, "grad_output must be float32");
   TORCH_CHECK(attn_weights.scalar_type() == torch::kFloat32, "attn_weights must be float32");
-  TORCH_CHECK(sampled_indices.scalar_type() == torch::kInt64, "sampled_indices must be int64");
+  TORCH_CHECK(
+      is_supported_treeattn_index_dtype(sampled_indices.scalar_type()),
+      "sampled_indices must be int32 or int64");
   TORCH_CHECK(sampled_indices.sizes() == attn_weights.sizes(), "sampled_indices and attn_weights must have the same shape");
   TORCH_CHECK(grad_output.size(0) == sampled_indices.size(0), "query length must match");
   TORCH_CHECK(grad_output.size(1) == sampled_indices.size(1), "batch dimensions must match");
@@ -185,9 +206,13 @@ torch::Tensor compute_grad_logit_non_causal_forward(
   TORCH_CHECK(current_nodes.dim() == 4, "current_nodes must have shape (L, B, H, S)");
   TORCH_CHECK(packed_paths.dim() == 5, "packed_paths must have shape (L, B, H, S, P)");
   TORCH_CHECK(grad_log_probs.dim() == 4, "grad_log_probs must have shape (L, B, H, S)");
-  TORCH_CHECK(q.scalar_type() == torch::kFloat32, "q must be float32");
-  TORCH_CHECK(k.scalar_type() == torch::kFloat32, "k must be float32");
-  TORCH_CHECK(current_nodes.scalar_type() == torch::kInt64, "current_nodes must be int64");
+  TORCH_CHECK(q.scalar_type() == k.scalar_type(), "q and k must have the same dtype");
+  TORCH_CHECK(
+      is_supported_treeattn_dtype(q.scalar_type()),
+      "q and k must be float32, float16, or bfloat16");
+  TORCH_CHECK(
+      is_supported_treeattn_index_dtype(current_nodes.scalar_type()),
+      "current_nodes must be int32 or int64");
   TORCH_CHECK(packed_paths.scalar_type() == torch::kUInt8, "packed_paths must be uint8");
   TORCH_CHECK(grad_log_probs.scalar_type() == torch::kFloat32, "grad_log_probs must be float32");
   TORCH_CHECK(depth >= 0, "depth must be >= 0");
@@ -233,9 +258,13 @@ void accumulate_qk_non_causal_inplace(
   TORCH_CHECK(grad_log_probs.dim() == 4, "grad_log_probs must have shape (L, B, H, S)");
   TORCH_CHECK(grad_q_out.dim() == 4, "grad_q_out must have shape (L, B, H, D)");
   TORCH_CHECK(grad_k_out.dim() == 4, "grad_k_out must have shape (K, B, H, D)");
-  TORCH_CHECK(q.scalar_type() == torch::kFloat32, "q must be float32");
-  TORCH_CHECK(k.scalar_type() == torch::kFloat32, "k must be float32");
-  TORCH_CHECK(current_nodes.scalar_type() == torch::kInt64, "current_nodes must be int64");
+  TORCH_CHECK(q.scalar_type() == k.scalar_type(), "q and k must have the same dtype");
+  TORCH_CHECK(
+      is_supported_treeattn_dtype(q.scalar_type()),
+      "q and k must be float32, float16, or bfloat16");
+  TORCH_CHECK(
+      is_supported_treeattn_index_dtype(current_nodes.scalar_type()),
+      "current_nodes must be int32 or int64");
   TORCH_CHECK(packed_paths.scalar_type() == torch::kUInt8, "packed_paths must be uint8");
   TORCH_CHECK(grad_log_probs.scalar_type() == torch::kFloat32, "grad_log_probs must be float32");
   TORCH_CHECK(grad_q_out.scalar_type() == torch::kFloat32, "grad_q_out must be float32");
@@ -284,8 +313,10 @@ void accumulate_qk_non_causal_all_depths_inplace(
   TORCH_CHECK(grad_log_probs.dim() == 4, "grad_log_probs must have shape (L, B, H, S)");
   TORCH_CHECK(grad_q_out.dim() == 4, "grad_q_out must have shape (L, B, H, D)");
   TORCH_CHECK(grad_k_out.dim() == 4, "grad_k_out must have shape (K, B, H, D)");
-  TORCH_CHECK(q.scalar_type() == torch::kFloat32, "q must be float32");
-  TORCH_CHECK(k.scalar_type() == torch::kFloat32, "k must be float32");
+  TORCH_CHECK(q.scalar_type() == k.scalar_type(), "q and k must have the same dtype");
+  TORCH_CHECK(
+      is_supported_treeattn_dtype(q.scalar_type()),
+      "q and k must be float32, float16, or bfloat16");
   TORCH_CHECK(packed_paths.scalar_type() == torch::kUInt8, "packed_paths must be uint8");
   TORCH_CHECK(grad_log_probs.scalar_type() == torch::kFloat32, "grad_log_probs must be float32");
   TORCH_CHECK(grad_q_out.scalar_type() == torch::kFloat32, "grad_q_out must be float32");

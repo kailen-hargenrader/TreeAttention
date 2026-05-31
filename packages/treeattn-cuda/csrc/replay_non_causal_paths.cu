@@ -1,7 +1,11 @@
+#include <ATen/AccumulateType.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/util/BFloat16.h>
+#include <c10/util/Half.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
+#include <cstdint>
 #include <tuple>
 
 namespace {
@@ -13,11 +17,12 @@ __device__ __forceinline__ float log_sigmoid_forward(float x) {
   return x - log1pf(expf(x));
 }
 
+template <typename scalar_t, typename acc_t>
 __global__ void replay_non_causal_paths_forward_kernel(
-    const float* __restrict__ q,
-    const float* __restrict__ k,
+  const scalar_t* __restrict__ q,
+  const scalar_t* __restrict__ k,
     const uint8_t* __restrict__ packed_paths,
-    int64_t* __restrict__ sampled_indices,
+    int32_t* __restrict__ sampled_indices,
     float* __restrict__ path_log_probs,
     int64_t k_len,
     int64_t batch,
@@ -54,22 +59,24 @@ __global__ void replay_non_causal_paths_forward_kernel(
     const int64_t direction = static_cast<int64_t>((packed_byte >> bit_offset) & 1U);
 
     const int64_t k_offset = (((node_idx * batch) + batch_idx) * nheads + head_idx) * width;
-    float dot = 0.0f;
+    acc_t dot = static_cast<acc_t>(0);
     for (int64_t d = 0; d < width; ++d) {
-      dot += q[q_offset + d] * k[k_offset + d];
+      dot += static_cast<acc_t>(q[q_offset + d]) * static_cast<acc_t>(k[k_offset + d]);
     }
 
-    if (dot > max_logit) {
-      dot = max_logit;
-    } else if (dot < -max_logit) {
-      dot = -max_logit;
+    const acc_t max_logit_acc = static_cast<acc_t>(max_logit);
+    if (dot > max_logit_acc) {
+      dot = max_logit_acc;
+    } else if (dot < -max_logit_acc) {
+      dot = -max_logit_acc;
     }
 
-    log_prob += direction == 0 ? log_sigmoid_forward(dot) : log_sigmoid_forward(-dot);
+    log_prob += direction == 0 ? log_sigmoid_forward(static_cast<float>(dot))
+                               : log_sigmoid_forward(static_cast<float>(-dot));
     node_idx = 2 * node_idx + 1 + direction;
   }
 
-  sampled_indices[linear_idx] = node_idx - k_len;
+  sampled_indices[linear_idx] = static_cast<int32_t>(node_idx - k_len);
   path_log_probs[linear_idx] = log_prob;
 }
 
@@ -102,7 +109,7 @@ std::tuple<torch::Tensor, torch::Tensor> replay_non_causal_paths_forward_cuda(
 
   auto sampled_indices = torch::empty(
       {num_queries, batch, nheads, num_samples},
-      q.options().dtype(torch::kInt64));
+      q.options().dtype(torch::kInt32));
   auto path_log_probs = torch::empty(
       {num_queries, batch, nheads, num_samples},
       q.options().dtype(torch::kFloat32));
@@ -111,25 +118,33 @@ std::tuple<torch::Tensor, torch::Tensor> replay_non_causal_paths_forward_cuda(
   const int64_t total = num_queries * batch * nheads * num_samples;
   const int blocks = static_cast<int>((total + threads - 1) / threads);
 
-  replay_non_causal_paths_forward_kernel<<<
-      blocks,
-      threads,
-      0,
-      at::cuda::getDefaultCUDAStream()>>>(
-      q.data_ptr<float>(),
-      k.data_ptr<float>(),
-      packed_paths.data_ptr<uint8_t>(),
-      sampled_indices.data_ptr<int64_t>(),
-      path_log_probs.data_ptr<float>(),
-      k_len,
-      batch,
-      nheads,
-      width,
-      num_queries,
-      num_samples,
-      path_bytes,
-      log_n,
-      static_cast<float>(max_logit));
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      q.scalar_type(),
+      "replay_non_causal_paths_forward_cuda",
+      [&] {
+        using acc_t = at::acc_type<scalar_t, true>;
+        replay_non_causal_paths_forward_kernel<scalar_t, acc_t><<<
+            blocks,
+            threads,
+            0,
+            at::cuda::getDefaultCUDAStream()>>>(
+            q.data_ptr<scalar_t>(),
+            k.data_ptr<scalar_t>(),
+            packed_paths.data_ptr<uint8_t>(),
+            sampled_indices.data_ptr<int32_t>(),
+            path_log_probs.data_ptr<float>(),
+            k_len,
+            batch,
+            nheads,
+            width,
+            num_queries,
+            num_samples,
+            path_bytes,
+            log_n,
+            static_cast<float>(max_logit));
+      });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   return std::make_tuple(sampled_indices, path_log_probs);

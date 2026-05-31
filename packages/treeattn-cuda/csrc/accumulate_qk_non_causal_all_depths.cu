@@ -1,3 +1,4 @@
+#include <ATen/AccumulateType.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
@@ -22,9 +23,10 @@ int64_t compute_log_n_host(int64_t num_leaves) {
   return log_n;
 }
 
+template <typename scalar_t, typename acc_t>
 __global__ void accumulate_qk_non_causal_all_depths_inplace_kernel(
-    const float* __restrict__ q,
-    const float* __restrict__ k,
+  const scalar_t* __restrict__ q,
+  const scalar_t* __restrict__ k,
     const uint8_t* __restrict__ packed_paths,
     const float* __restrict__ grad_log_probs,
     float* __restrict__ grad_q_out,
@@ -64,20 +66,21 @@ __global__ void accumulate_qk_non_causal_all_depths_inplace_kernel(
     const float branch_sign = bit == 0 ? 1.0f : -1.0f;
     const int64_t k_offset = (((node_idx * batch) + batch_idx) * nheads + head_idx) * width;
 
-    float dot = 0.0f;
+    acc_t dot = static_cast<acc_t>(0);
     for (int64_t d = 0; d < width; ++d) {
-      dot += q[q_offset + d] * k[k_offset + d];
+      dot += static_cast<acc_t>(q[q_offset + d]) * static_cast<acc_t>(k[k_offset + d]);
     }
-    if (dot > max_logit) {
-      dot = max_logit;
-    } else if (dot < -max_logit) {
-      dot = -max_logit;
+    const acc_t max_logit_acc = static_cast<acc_t>(max_logit);
+    if (dot > max_logit_acc) {
+      dot = max_logit_acc;
+    } else if (dot < -max_logit_acc) {
+      dot = -max_logit_acc;
     }
 
-    const float grad_logit = branch_sign * sigmoid_forward(-branch_sign * dot) * sample_grad_log_probs;
+    const float grad_logit = branch_sign * sigmoid_forward(-branch_sign * static_cast<float>(dot)) * sample_grad_log_probs;
     for (int64_t d = 0; d < width; ++d) {
-      atomicAdd(grad_q_out + q_offset + d, grad_logit * k[k_offset + d]);
-      atomicAdd(grad_k_out + k_offset + d, grad_logit * q[q_offset + d]);
+      atomicAdd(grad_q_out + q_offset + d, grad_logit * static_cast<float>(k[k_offset + d]));
+      atomicAdd(grad_k_out + k_offset + d, grad_logit * static_cast<float>(q[q_offset + d]));
     }
 
     node_idx = 2 * node_idx + 1 + bit;
@@ -109,25 +112,33 @@ void accumulate_qk_non_causal_all_depths_inplace_cuda(
   const int64_t total = num_queries * batch * nheads * num_samples;
   const int blocks = static_cast<int>((total + threads - 1) / threads);
 
-  accumulate_qk_non_causal_all_depths_inplace_kernel<<<
-      blocks,
-      threads,
-      0,
-      at::cuda::getDefaultCUDAStream()>>>(
-      q.data_ptr<float>(),
-      k.data_ptr<float>(),
-      packed_paths.data_ptr<uint8_t>(),
-      grad_log_probs.data_ptr<float>(),
-      grad_q_out.data_ptr<float>(),
-      grad_k_out.data_ptr<float>(),
-      k_len,
-      batch,
-      nheads,
-      width,
-      num_queries,
-      num_samples,
-      path_bytes,
-      log_n,
-      static_cast<float>(max_logit));
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      q.scalar_type(),
+      "accumulate_qk_non_causal_all_depths_inplace_cuda",
+      [&] {
+        using acc_t = at::acc_type<scalar_t, true>;
+        accumulate_qk_non_causal_all_depths_inplace_kernel<scalar_t, acc_t><<<
+            blocks,
+            threads,
+            0,
+            at::cuda::getDefaultCUDAStream()>>>(
+            q.data_ptr<scalar_t>(),
+            k.data_ptr<scalar_t>(),
+            packed_paths.data_ptr<uint8_t>(),
+            grad_log_probs.data_ptr<float>(),
+            grad_q_out.data_ptr<float>(),
+            grad_k_out.data_ptr<float>(),
+            k_len,
+            batch,
+            nheads,
+            width,
+            num_queries,
+            num_samples,
+            path_bytes,
+            log_n,
+            static_cast<float>(max_logit));
+      });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

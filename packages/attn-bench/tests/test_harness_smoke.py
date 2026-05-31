@@ -17,7 +17,11 @@ from attn_bench.baselines.treeattn_cuda import adapter as treeattn_cuda_adapter
 from attn_bench.baselines.flash_attn2 import adapter as fa2_adapter, is_available as fa2_available
 from attn_bench.configs import BenchConfig
 from attn_bench.harness import run_sweep_isolated, time_kernel
-from treeattn_cuda import hierarchical_attention as cuda_hierarchical_attention
+from treeattn_cuda import (
+    get_runtime_stats,
+    hierarchical_attention as cuda_hierarchical_attention,
+    reset_runtime_stats,
+)
 from treeattn_cuda import _native as treeattn_cuda_native
 from treeattn_cuda._autograd import (
     _accumulate_qk_non_causal_all_depths_inplace,
@@ -90,6 +94,13 @@ def test_treeattn_cuda_smoke(monkeypatch: pytest.MonkeyPatch) -> None:
     assert res.fwd_inference is not None and math.isfinite(res.fwd_inference.median_ms)
     assert res.step is not None and math.isfinite(res.step.median_ms)
     assert res.fwd_inference.median_ms > 0
+    assert "treeattn_cuda_fwd_used_native_any" in res.extra
+    assert "treeattn_cuda_fwd_used_python_any" in res.extra
+    assert "treeattn_cuda_step_used_native_any" in res.extra
+    assert "treeattn_cuda_step_used_python_any" in res.extra
+    row = res.row()
+    assert "treeattn_cuda_fwd_used_native_any" in row
+    assert "treeattn_cuda_step_used_python_any" in row
 
 
 def test_treeattn_cuda_path_replay_roundtrip() -> None:
@@ -112,6 +123,7 @@ def test_treeattn_cuda_path_replay_roundtrip() -> None:
         max_logit=1e3,
     )
 
+    assert sampled_indices.dtype == torch.int32
     assert packed_paths.dtype == torch.uint8
     assert packed_paths.numel() * packed_paths.element_size() < (
         sampled_indices.numel() * sampled_indices.element_size()
@@ -154,6 +166,47 @@ def test_treeattn_cuda_native_replay_matches_python() -> None:
     torch.testing.assert_close(native_log_probs, python_log_probs)
 
 
+def test_treeattn_cuda_native_replay_supports_bf16(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TREEATTN_CUDA_BUILD", "1")
+    if not treeattn_cuda_native.has_native_kernels():
+        pytest.skip("treeattn_cuda native replay kernel not enabled")
+
+    torch.manual_seed(0)
+    q = torch.randn((8, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((7, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
+
+    torch.manual_seed(123)
+    _, _, packed_paths = _sample_paths_non_causal_streaming(
+        q,
+        k,
+        num_samples=4,
+        block_size=4,
+        max_logit=1e3,
+    )
+
+    reset_runtime_stats()
+    native_indices, native_log_probs = _replay_non_causal_paths(
+        q,
+        k,
+        packed_paths,
+        block_size=4,
+        max_logit=1e3,
+    )
+    stats = get_runtime_stats()
+    python_indices, python_log_probs = _replay_non_causal_paths_python(
+        q,
+        k,
+        packed_paths,
+        block_size=4,
+        max_logit=1e3,
+    )
+
+    assert stats["replay_native_calls"] > 0
+    assert stats["replay_python_calls"] == 0
+    assert torch.equal(native_indices, python_indices)
+    torch.testing.assert_close(native_log_probs, python_log_probs)
+
+
 def test_treeattn_cuda_native_sampler_matches_python() -> None:
     if not treeattn_cuda_native.has_native_kernels():
         pytest.skip("treeattn_cuda native sampler kernel not enabled")
@@ -182,6 +235,75 @@ def test_treeattn_cuda_native_sampler_matches_python() -> None:
     assert torch.equal(native_indices, python_indices)
     assert torch.equal(native_packed, python_packed)
     torch.testing.assert_close(native_log_probs, python_log_probs)
+
+
+def test_treeattn_cuda_native_sampler_supports_bf16(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TREEATTN_CUDA_BUILD", "1")
+    if not treeattn_cuda_native.has_native_kernels():
+        pytest.skip("treeattn_cuda native sampler kernel not enabled")
+
+    torch.manual_seed(0)
+    q = torch.randn((8, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((7, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
+
+    reset_runtime_stats()
+    torch.manual_seed(123)
+    native_indices, native_log_probs, native_packed = _sample_paths_non_causal_streaming(
+        q,
+        k,
+        num_samples=4,
+        block_size=4,
+        max_logit=1e3,
+    )
+    stats = get_runtime_stats()
+
+    torch.manual_seed(123)
+    python_indices, python_log_probs, python_packed = _sample_paths_non_causal_streaming_python(
+        q,
+        k,
+        num_samples=4,
+        block_size=4,
+        max_logit=1e3,
+    )
+
+    assert stats["sample_native_calls"] > 0
+    assert stats["sample_python_calls"] == 0
+    assert torch.equal(native_indices, python_indices)
+    assert torch.equal(native_packed, python_packed)
+    torch.testing.assert_close(native_log_probs, python_log_probs)
+
+
+def test_treeattn_cuda_native_sampler_is_block_size_invariant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TREEATTN_CUDA_BUILD", "1")
+    if not treeattn_cuda_native.has_native_kernels():
+        pytest.skip("treeattn_cuda native sampler kernel not enabled")
+
+    torch.manual_seed(0)
+    q = torch.randn((32, 1, 2, 16), device="cuda", dtype=torch.float32)
+    k = torch.randn((31, 1, 2, 16), device="cuda", dtype=torch.float32)
+
+    torch.manual_seed(123)
+    small_block = _sample_paths_non_causal_streaming(
+        q,
+        k,
+        num_samples=4,
+        block_size=4,
+        max_logit=1e3,
+    )
+    torch.manual_seed(123)
+    large_block = _sample_paths_non_causal_streaming(
+        q,
+        k,
+        num_samples=4,
+        block_size=16,
+        max_logit=1e3,
+    )
+
+    assert torch.equal(small_block[0], large_block[0])
+    assert torch.equal(small_block[2], large_block[2])
+    torch.testing.assert_close(small_block[1], large_block[1])
 
 
 def test_treeattn_cuda_native_grad_v_matches_python() -> None:
@@ -250,6 +372,53 @@ def test_treeattn_cuda_native_grad_logit_matches_python() -> None:
     torch.testing.assert_close(native_grad_logit, python_grad_logit)
 
 
+def test_treeattn_cuda_native_grad_logit_supports_bf16(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TREEATTN_CUDA_BUILD", "1")
+    if not treeattn_cuda_native.has_native_kernels():
+        pytest.skip("treeattn_cuda native grad_logit kernel not enabled")
+
+    torch.manual_seed(0)
+    q = torch.randn((8, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((7, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
+    grad_log_probs = torch.randn((8, 1, 2, 4), device="cuda", dtype=torch.float32)
+    current_nodes = torch.randint(0, 7, (8, 1, 2, 4), device="cuda", dtype=torch.int64)
+    _, _, packed_paths = _sample_paths_non_causal_streaming_python(
+        q,
+        k,
+        num_samples=4,
+        block_size=4,
+        max_logit=1e3,
+    )
+
+    native_grad_logit = _compute_grad_logit_non_causal(
+        q,
+        k,
+        current_nodes,
+        packed_paths,
+        grad_log_probs,
+        depth=1,
+        max_logit=1e3,
+    )
+    assert native_grad_logit is not None
+
+    stats = get_runtime_stats()
+    assert stats["grad_logit_native_calls"] > 0
+    assert stats["grad_logit_python_calls"] == 0
+
+    gathered_keys = torch.gather(
+        k.to(torch.float32).permute(1, 2, 0, 3).contiguous().expand(8, 1, 2, 7, 16),
+        dim=-2,
+        index=current_nodes.unsqueeze(-1).expand(8, 1, 2, 4, 16),
+    )
+    bit = ((packed_paths[..., 0] >> 1) & 1).to(torch.int64)
+    branch_sign = torch.where(bit == 0, 1.0, -1.0).to(torch.float32)
+    logits = (
+        q.to(torch.float32).unsqueeze(-2) * gathered_keys
+    ).sum(dim=-1).clamp(min=-1e3, max=1e3)
+    python_grad_logit = branch_sign * torch.sigmoid(-branch_sign * logits) * grad_log_probs
+    torch.testing.assert_close(native_grad_logit, python_grad_logit, rtol=5e-3, atol=5e-3)
+
+
 def test_treeattn_cuda_native_qk_accum_matches_python() -> None:
     if not treeattn_cuda_native.has_native_kernels():
         pytest.skip("treeattn_cuda native qk kernel not enabled")
@@ -299,6 +468,62 @@ def test_treeattn_cuda_native_qk_accum_matches_python() -> None:
     torch.testing.assert_close(grad_k_native, grad_k_python)
 
 
+def test_treeattn_cuda_native_qk_accum_supports_bf16(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TREEATTN_CUDA_BUILD", "1")
+    if not treeattn_cuda_native.has_native_kernels():
+        pytest.skip("treeattn_cuda native qk kernel not enabled")
+
+    torch.manual_seed(0)
+    q = torch.randn((8, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((7, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
+    grad_log_probs = torch.randn((8, 1, 2, 4), device="cuda", dtype=torch.float32)
+    current_nodes = torch.randint(0, 7, (8, 1, 2, 4), device="cuda", dtype=torch.int64)
+    _, _, packed_paths = _sample_paths_non_causal_streaming_python(
+        q,
+        k,
+        num_samples=4,
+        block_size=4,
+        max_logit=1e3,
+    )
+
+    grad_q_native = torch.zeros((8, 1, 2, 16), device="cuda", dtype=torch.float32)
+    grad_k_native = torch.zeros((7, 1, 2, 16), device="cuda", dtype=torch.float32)
+    used_native = _accumulate_qk_non_causal_inplace(
+        q,
+        k,
+        current_nodes,
+        packed_paths,
+        grad_log_probs,
+        depth=1,
+        max_logit=1e3,
+        grad_q_out=grad_q_native,
+        grad_k_out=grad_k_native,
+    )
+    assert used_native
+
+    stats = get_runtime_stats()
+    assert stats["accumulate_qk_native_calls"] > 0
+    assert stats["accumulate_qk_python_calls"] == 0
+
+    bit = ((packed_paths[..., 0] >> 1) & 1).to(torch.int64)
+    branch_sign = torch.where(bit == 0, 1.0, -1.0).to(torch.float32)
+    gathered_keys = torch.gather(
+        k.to(torch.float32).permute(1, 2, 0, 3).contiguous().expand(8, 1, 2, 7, 16),
+        dim=-2,
+        index=current_nodes.unsqueeze(-1).expand(8, 1, 2, 4, 16),
+    )
+    logits = (
+        q.to(torch.float32).unsqueeze(-2) * gathered_keys
+    ).sum(dim=-1).clamp(min=-1e3, max=1e3)
+    grad_logit = branch_sign * torch.sigmoid(-branch_sign * logits) * grad_log_probs
+    grad_q_python = (grad_logit.unsqueeze(-1) * gathered_keys).sum(dim=-2)
+    grad_k_updates = grad_logit.unsqueeze(-1) * q.to(torch.float32).unsqueeze(-2)
+    grad_k_python = _scatter_tree_updates(7, current_nodes, grad_k_updates)
+
+    torch.testing.assert_close(grad_q_native, grad_q_python, rtol=5e-3, atol=5e-3)
+    torch.testing.assert_close(grad_k_native, grad_k_python, rtol=5e-3, atol=5e-3)
+
+
 def test_treeattn_cuda_native_full_qk_accum_matches_python() -> None:
     if not treeattn_cuda_native.has_native_kernels():
         pytest.skip("treeattn_cuda native fused qk kernel not enabled")
@@ -343,6 +568,66 @@ def test_treeattn_cuda_native_full_qk_accum_matches_python() -> None:
         grad_logit = branch_sign * torch.sigmoid(-branch_sign * logits) * grad_log_probs
         grad_q_python = grad_q_python + (grad_logit.unsqueeze(-1) * gathered_keys).sum(dim=-2)
         grad_k_updates = grad_logit.unsqueeze(-1) * q.unsqueeze(-2)
+        grad_k_python = grad_k_python + _scatter_tree_updates(7, node_idx, grad_k_updates)
+        if depth + 1 < log_n:
+            node_idx = 2 * node_idx + 1 + bit
+
+    torch.testing.assert_close(grad_q_native, grad_q_python)
+    torch.testing.assert_close(grad_k_native, grad_k_python)
+
+
+def test_treeattn_cuda_native_full_qk_accum_supports_bf16(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TREEATTN_CUDA_BUILD", "1")
+    if not treeattn_cuda_native.has_native_kernels():
+        pytest.skip("treeattn_cuda native fused qk kernel not enabled")
+
+    torch.manual_seed(0)
+    q = torch.randn((8, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((7, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
+    grad_log_probs = torch.randn((8, 1, 2, 4), device="cuda", dtype=torch.float32)
+    _, _, packed_paths = _sample_paths_non_causal_streaming_python(
+        q,
+        k,
+        num_samples=4,
+        block_size=4,
+        max_logit=1e3,
+    )
+
+    grad_q_native = torch.zeros((8, 1, 2, 16), device="cuda", dtype=torch.float32)
+    grad_k_native = torch.zeros((7, 1, 2, 16), device="cuda", dtype=torch.float32)
+    reset_runtime_stats()
+    used_native = _accumulate_qk_non_causal_all_depths_inplace(
+        q,
+        k,
+        packed_paths,
+        grad_log_probs,
+        max_logit=1e3,
+        grad_q_out=grad_q_native,
+        grad_k_out=grad_k_native,
+    )
+    stats = get_runtime_stats()
+    assert used_native
+    assert stats["accumulate_qk_all_depths_native_calls"] > 0
+    assert stats["accumulate_qk_all_depths_python_calls"] == 0
+
+    q_accum = q.to(torch.float32)
+    k_accum = k.to(torch.float32)
+    grad_q_python = torch.zeros_like(q_accum)
+    grad_k_python = torch.zeros_like(k_accum)
+    node_idx = torch.zeros((8, 1, 2, 4), device="cuda", dtype=torch.int64)
+    log_n = (k.shape[0] + 1).bit_length() - 1
+    for depth in range(log_n):
+        bit = ((packed_paths[..., depth // 8] >> (depth % 8)) & 1).to(torch.int64)
+        branch_sign = torch.where(bit == 0, 1.0, -1.0).to(torch.float32)
+        gathered_keys = torch.gather(
+            k_accum.permute(1, 2, 0, 3).contiguous().expand(8, 1, 2, 7, 16),
+            dim=-2,
+            index=node_idx.unsqueeze(-1).expand(8, 1, 2, 4, 16),
+        )
+        logits = (q_accum.unsqueeze(-2) * gathered_keys).sum(dim=-1).clamp(min=-1e3, max=1e3)
+        grad_logit = branch_sign * torch.sigmoid(-branch_sign * logits) * grad_log_probs
+        grad_q_python = grad_q_python + (grad_logit.unsqueeze(-1) * gathered_keys).sum(dim=-2)
+        grad_k_updates = grad_logit.unsqueeze(-1) * q_accum.unsqueeze(-2)
         grad_k_python = grad_k_python + _scatter_tree_updates(7, node_idx, grad_k_updates)
         if depth + 1 < log_n:
             node_idx = 2 * node_idx + 1 + bit
