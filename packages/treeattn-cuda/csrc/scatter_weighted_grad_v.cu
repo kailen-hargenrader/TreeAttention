@@ -1,0 +1,91 @@
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <torch/extension.h>
+
+namespace {
+
+__global__ void scatter_weighted_grad_v_forward_kernel(
+    const float* __restrict__ grad_output,
+    const int64_t* __restrict__ sampled_indices,
+    const float* __restrict__ attn_weights,
+    float* __restrict__ grad_v,
+    int64_t num_leaves,
+    int64_t batch,
+    int64_t nheads,
+    int64_t width,
+    int64_t num_queries,
+    int64_t num_samples) {
+  const int64_t linear_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = num_queries * batch * nheads * num_samples * width;
+  if (linear_idx >= total) {
+    return;
+  }
+
+  int64_t tmp = linear_idx;
+  const int64_t d = tmp % width;
+  tmp /= width;
+  const int64_t sample_idx = tmp % num_samples;
+  tmp /= num_samples;
+  const int64_t head_idx = tmp % nheads;
+  tmp /= nheads;
+  const int64_t batch_idx = tmp % batch;
+  const int64_t query_idx = tmp / batch;
+
+  int64_t leaf_idx = (((query_idx * batch) + batch_idx) * nheads + head_idx) * num_samples + sample_idx;
+  leaf_idx = sampled_indices[leaf_idx];
+  if (leaf_idx < 0) {
+    leaf_idx = 0;
+  } else if (leaf_idx >= num_leaves) {
+    leaf_idx = num_leaves - 1;
+  }
+
+  const int64_t grad_out_offset = (((query_idx * batch) + batch_idx) * nheads + head_idx) * width + d;
+  const int64_t weight_offset = (((query_idx * batch) + batch_idx) * nheads + head_idx) * num_samples + sample_idx;
+  const int64_t grad_v_offset = (((leaf_idx * batch) + batch_idx) * nheads + head_idx) * width + d;
+
+  atomicAdd(
+      grad_v + grad_v_offset,
+      attn_weights[weight_offset] * grad_output[grad_out_offset]);
+}
+
+}  // namespace
+
+torch::Tensor scatter_weighted_grad_v_forward_cuda(
+    const torch::Tensor& grad_output,
+    const torch::Tensor& sampled_indices,
+    const torch::Tensor& attn_weights,
+    int64_t num_leaves) {
+  c10::cuda::CUDAGuard device_guard(grad_output.device());
+
+  const auto num_queries = grad_output.size(0);
+  const auto batch = grad_output.size(1);
+  const auto nheads = grad_output.size(2);
+  const auto width = grad_output.size(3);
+  const auto num_samples = sampled_indices.size(3);
+
+  auto grad_v = torch::zeros(
+      {num_leaves, batch, nheads, width},
+      grad_output.options());
+
+  constexpr int threads = 256;
+  const int64_t total = num_queries * batch * nheads * num_samples * width;
+  const int blocks = static_cast<int>((total + threads - 1) / threads);
+
+  scatter_weighted_grad_v_forward_kernel<<<
+      blocks,
+      threads,
+      0,
+      at::cuda::getDefaultCUDAStream()>>>(
+      grad_output.data_ptr<float>(),
+      sampled_indices.data_ptr<int64_t>(),
+      attn_weights.data_ptr<float>(),
+      grad_v.data_ptr<float>(),
+      num_leaves,
+      batch,
+      nheads,
+      width,
+      num_queries,
+      num_samples);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return grad_v;
+}

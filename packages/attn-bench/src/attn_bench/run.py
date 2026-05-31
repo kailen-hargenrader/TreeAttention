@@ -203,11 +203,11 @@ def main(argv: list[str] | None = None) -> int:
         cfg = r.config
         shape = f"s={cfg.seqlen:<7}"
         if r.status == "ok":
-            fwd = r.fwd.median_ms if r.fwd else float("nan")
-            bwd = r.bwd.median_ms if r.bwd else float("nan")
+            inf = r.fwd_inference.median_ms if r.fwd_inference else float("nan")
+            stp = r.step.median_ms if r.step else float("nan")
             print(
                 f"  [{marker:>4}] {r.kernel:<16} {shape}  "
-                f"fwd={fwd:7.3f}ms  bwd={bwd:7.3f}ms  "
+                f"inf={inf:7.3f}ms  step={stp:7.3f}ms  "
                 f"mem(fwd/bwd)={r.fwd_peak_mem_mb:7.1f}/{r.bwd_peak_mem_mb:7.1f} MiB"
             )
         else:

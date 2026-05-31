@@ -14,11 +14,13 @@ dependencies = [
 [project.optional-dependencies]
 treeattn-torch = ["treeattn-torch"]
 treeattn-jax = ["treeattn-jax"]
-treeattn = ["treeattn-torch", "treeattn-jax"]
+treeattn-cuda = ["treeattn-cuda"]
+treeattn = ["treeattn-torch", "treeattn-jax", "treeattn-cuda"]
 
 [tool.uv.sources]
 treeattn-torch = { workspace = true }
 treeattn-jax = { workspace = true }
+treeattn-cuda = { workspace = true }
 
 [project.scripts]
 attn-bench = "attn_bench.run:main"

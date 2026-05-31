@@ -39,13 +39,13 @@ def annotate_speedups(results: list[Result], baseline_name: str = PRIMARY_BASELI
         row = r.row()
         base = by_cfg.get(_cfg_key(r))
         if base is not None and r.kernel != baseline_name and r.status == "ok":
-            row["speedup_fwd_vs_" + baseline_name] = _speedup(
-                base.fwd.median_ms if base.fwd else None,
-                r.fwd.median_ms if r.fwd else None,
+            row["speedup_fwd_inference_vs_" + baseline_name] = _speedup(
+                base.fwd_inference.median_ms if base.fwd_inference else None,
+                r.fwd_inference.median_ms if r.fwd_inference else None,
             )
-            row["speedup_bwd_vs_" + baseline_name] = _speedup(
-                base.bwd.median_ms if base.bwd else None,
-                r.bwd.median_ms if r.bwd else None,
+            row["speedup_step_vs_" + baseline_name] = _speedup(
+                base.step.median_ms if base.step else None,
+                r.step.median_ms if r.step else None,
             )
         rows.append(row)
     return rows
@@ -91,8 +91,8 @@ def _fmt(x, spec: str = ".3f") -> str:
 
 def print_table(rows: list[dict], baseline_name: str = PRIMARY_BASELINE) -> None:
     """Print a compact stdout table; uses ``rich`` if available, else plain."""
-    sp_fwd_key = f"speedup_fwd_vs_{baseline_name}"
-    sp_bwd_key = f"speedup_bwd_vs_{baseline_name}"
+    sp_fwd_key = f"speedup_fwd_inference_vs_{baseline_name}"
+    sp_step_key = f"speedup_step_vs_{baseline_name}"
 
     cols: list[tuple[str, str, "callable"]] = [
         ("kernel",  "left",   lambda r: str(r.get("kernel", "-"))),
@@ -103,16 +103,15 @@ def print_table(rows: list[dict], baseline_name: str = PRIMARY_BASELINE) -> None
         ("d",       "right",  lambda r: str(r.get("head_dim", "-"))),
         ("causal",  "center", lambda r: str(r.get("causal", "-"))),
         ("status",  "left",   lambda r: str(r.get("status", "-"))),
-        ("fwd_ms",  "right",  lambda r: _fmt(r.get("fwd_ms_median"), ".3f")),
-        ("bwd_ms",  "right",  lambda r: _fmt(r.get("bwd_ms_median"), ".3f")),
-        ("fwd_TF/s","right",  lambda r: _fmt(r.get("fwd_tflops"), ".1f")),
-        ("bwd_TF/s","right",  lambda r: _fmt(r.get("bwd_tflops"), ".1f")),
+        ("inf_ms",  "right",  lambda r: _fmt(r.get("fwd_inference_ms_median"), ".3f")),
+        ("step_ms", "right",  lambda r: _fmt(r.get("step_ms_median"), ".3f")),
+        ("inf_TF/s","right",  lambda r: _fmt(r.get("fwd_inference_tflops"), ".1f")),
+        ("step_TF/s","right", lambda r: _fmt(r.get("step_tflops"), ".1f")),
         ("fwd_mem_MiB","right", lambda r: _fmt(r.get("fwd_peak_mem_mb"), ".1f")),
-        ("fwd_resid_MiB","right", lambda r: _fmt(r.get("fwd_residual_mem_mb"), ".1f")),
-        ("fwd_saved_MiB","right", lambda r: _fmt(r.get("fwd_saved_mem_mb"), ".1f")),
+        ("saved_MiB","right", lambda r: _fmt(r.get("fwd_saved_mem_mb"), ".1f")),
         ("bwd_mem_MiB","right", lambda r: _fmt(r.get("bwd_peak_mem_mb"), ".1f")),
-        (f"sp_fwd/{baseline_name}", "right", lambda r: _fmt(r.get(sp_fwd_key), ".2f")),
-        (f"sp_bwd/{baseline_name}", "right", lambda r: _fmt(r.get(sp_bwd_key), ".2f")),
+        (f"sp_inf/{baseline_name}", "right", lambda r: _fmt(r.get(sp_fwd_key), ".2f")),
+        (f"sp_step/{baseline_name}", "right", lambda r: _fmt(r.get(sp_step_key), ".2f")),
     ]
 
     try:

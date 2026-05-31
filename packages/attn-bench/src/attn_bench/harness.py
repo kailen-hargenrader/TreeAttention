@@ -68,12 +68,11 @@ class Result:
     kernel: str
     config: BenchConfig
     status: str  # "ok" | "oom" | "skipped" | "error"
-    fwd: Optional[TimingStats] = None
-    bwd: Optional[TimingStats] = None
-    fwd_tflops: float = float("nan")
-    bwd_tflops: float = float("nan")
+    fwd_inference: Optional[TimingStats] = None
+    step: Optional[TimingStats] = None
+    fwd_inference_tflops: float = float("nan")
+    step_tflops: float = float("nan")
     fwd_peak_mem_mb: float = float("nan")
-    fwd_residual_mem_mb: float = float("nan")
     fwd_saved_mem_mb: float = float("nan")
     bwd_peak_mem_mb: float = float("nan")
     error_msg: str = ""
@@ -93,26 +92,28 @@ class Result:
             "causal": cfg.causal,
             "status": self.status,
         }
-        if self.fwd is not None:
+        if self.fwd_inference is not None:
             row.update({
-                "fwd_ms_median": self.fwd.median_ms,
-                "fwd_ms_mean": self.fwd.mean_ms,
-                "fwd_ms_std": self.fwd.std_ms,
-                "fwd_ms_p10": self.fwd.p10_ms,
-                "fwd_ms_p90": self.fwd.p90_ms,
-                "fwd_tflops": self.fwd_tflops,
-                "fwd_peak_mem_mb": self.fwd_peak_mem_mb,
-                "fwd_residual_mem_mb": self.fwd_residual_mem_mb,
-                "fwd_saved_mem_mb": self.fwd_saved_mem_mb,
+                "fwd_inference_ms_median": self.fwd_inference.median_ms,
+                "fwd_inference_ms_mean": self.fwd_inference.mean_ms,
+                "fwd_inference_ms_std": self.fwd_inference.std_ms,
+                "fwd_inference_ms_p10": self.fwd_inference.p10_ms,
+                "fwd_inference_ms_p90": self.fwd_inference.p90_ms,
+                "fwd_inference_tflops": self.fwd_inference_tflops,
             })
-        if self.bwd is not None:
+        if self.step is not None:
             row.update({
-                "bwd_ms_median": self.bwd.median_ms,
-                "bwd_ms_mean": self.bwd.mean_ms,
-                "bwd_ms_std": self.bwd.std_ms,
-                "bwd_ms_p10": self.bwd.p10_ms,
-                "bwd_ms_p90": self.bwd.p90_ms,
-                "bwd_tflops": self.bwd_tflops,
+                "step_ms_median": self.step.median_ms,
+                "step_ms_mean": self.step.mean_ms,
+                "step_ms_std": self.step.std_ms,
+                "step_ms_p10": self.step.p10_ms,
+                "step_ms_p90": self.step.p90_ms,
+                "step_tflops": self.step_tflops,
+            })
+        if self.status == "ok":
+            row.update({
+                "fwd_peak_mem_mb": self.fwd_peak_mem_mb,
+                "fwd_saved_mem_mb": self.fwd_saved_mem_mb,
                 "bwd_peak_mem_mb": self.bwd_peak_mem_mb,
             })
         if self.error_msg:
@@ -190,48 +191,70 @@ def _time_callable(fn, *, warmup: int, iters: int) -> list[float]:
     return _time_iters(fn, iters)
 
 
-def _measure_peak_mem_mb(fn) -> float:
-    """Run ``fn()`` once and return the CUDA peak allocated bytes (MiB).
+def _jax_bytes_in_use() -> int:
+    """Return total bytes_in_use across local JAX devices, or 0.
 
-    Resets the peak stats immediately before the call so the value reflects
-    only this invocation's allocations (subject to the caching allocator's
-    pre-existing reservations).
+    Tolerates: jax not installed, PJRT plugins that return ``None`` from
+    ``memory_stats()``, and stats dicts missing ``bytes_in_use``.
+    """
+    try:
+        import jax  # type: ignore
+    except Exception:
+        return 0
+    total = 0
+    try:
+        for d in jax.local_devices():
+            stats = d.memory_stats() if hasattr(d, "memory_stats") else None
+            if not stats:
+                continue
+            total += int(stats.get("bytes_in_use", 0))
+    except Exception:
+        return 0
+    return total
+
+
+def _device_bytes_in_use() -> int:
+    """torch CUDA allocator bytes + JAX devices' bytes_in_use, summed.
+
+    Lets memory probes see allocations made through framework-foreign
+    allocators (e.g. JAX/XLA's BFC pool) that ``torch.cuda.memory_allocated``
+    alone would miss.
+    """
+    return torch.cuda.memory_allocated() + _jax_bytes_in_use()
+
+
+def _measure_peak_mem_mb(fn) -> float:
+    """Run ``fn()`` once and return an approximate device peak (MiB).
+
+    Combines torch's true peak counter with JAX's resident-bytes delta
+    around the call. JAX/PJRT exposes ``bytes_in_use`` (current resident)
+    but no peak counter, so the JAX contribution is a lower bound (it
+    misses transients that were freed before sync). For pure-torch
+    kernels this reduces to ``torch.cuda.max_memory_allocated``.
     """
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
+    jax_before = _jax_bytes_in_use()
     fn()
     torch.cuda.synchronize()
-    return torch.cuda.max_memory_allocated() / (1024 * 1024)
-
-
-def _measure_fwd_residual_mb(fn) -> float:
-    """Memory still allocated after ``fn()`` returns and its output is dropped.
-
-    Captures allocator state before the call, runs the call, drops the
-    returned tensor, and returns the delta in allocated bytes (MiB). A
-    kernel that frees everything it allocated will report ~0; a kernel
-    that retains internal buffers will report >0.
-    """
-    torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated()
-    out = fn()
-    del out
-    torch.cuda.synchronize()
-    after = torch.cuda.memory_allocated()
-    return max(after - before, 0) / (1024 * 1024)
+    torch_peak = torch.cuda.max_memory_allocated()
+    jax_after = _jax_bytes_in_use()
+    jax_delta = max(jax_after - jax_before, 0)
+    return (torch_peak + jax_delta) / (1024 * 1024)
 
 
 def _measure_fwd_saved_mb(fn) -> float:
-    """Memory held by the autograd graph + saved-for-backward tensors after fwd.
+    """Device memory retained after a forward, with output kept alive.
 
-    Runs ``fn()`` with grad enabled, measures allocator delta while the
-    returned output (and thus the graph) is still alive, then drops it.
+    Runs ``fn()`` with grad enabled, measures the cross-allocator delta
+    while the returned output (and thus saved-for-backward tensors and
+    any framework-side VJP closure) is still alive, then drops it.
     """
     torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated()
+    before = _device_bytes_in_use()
     out = fn()
     torch.cuda.synchronize()
-    after = torch.cuda.memory_allocated()
+    after = _device_bytes_in_use()
     del out
     return max(after - before, 0) / (1024 * 1024)
 
@@ -283,53 +306,29 @@ def time_kernel(
         softmax_scale = 1.0 / (cfg.head_dim ** 0.5)
         pre_ptrs = _ptr_snapshot(q, k, v)
 
-        # ----- forward timing -----
-        def fwd_only():
+        fwd_flops_val = fwd_flops(cfg.batch, cfg.seqlen, cfg.nheads, cfg.head_dim, cfg.causal)
+        bwd_flops_val = bwd_flops(cfg.batch, cfg.seqlen, cfg.nheads, cfg.head_dim, cfg.causal)
+
+        # ===== timing pass 1: inference forward (no autograd) =====
+        def fwd_inference():
             with torch.no_grad():
                 _ = adapter.fn(q, k, v, cfg.causal, softmax_scale)
 
         _warmup_with_leak_check(
-            fwd_only, warmup,
-            on_leak=_on_leak("fwd"),
+            fwd_inference, warmup,
+            on_leak=_on_leak("fwd_inference"),
             threshold_mb=leak_threshold_mb,
         )
-        fwd_samples = _time_iters(fwd_only, iters)
-        fwd_stats = TimingStats.from_samples(fwd_samples)
+        fwd_inf_samples = _time_iters(fwd_inference, iters)
+        fwd_inf_stats = TimingStats.from_samples(fwd_inf_samples)
         check_no_inplace(pre_ptrs, (q, k, v))
+        fwd_inf_tf = tflops_per_sec(fwd_flops_val, fwd_inf_stats.median_ms)
 
-        fwd_flops_val = fwd_flops(cfg.batch, cfg.seqlen, cfg.nheads, cfg.head_dim, cfg.causal)
-        fwd_tf = tflops_per_sec(fwd_flops_val, fwd_stats.median_ms)
-
-        # Peak-memory measurement for the forward pass. One extra call with
-        # the allocator's peak counter reset; reported in MiB.
-        fwd_peak_mb = _measure_peak_mem_mb(fwd_only)
-
-        # Residual memory: what's still allocated after a forward whose
-        # output has been dropped. Catches kernels that retain internal
-        # workspace tensors.
-        def fwd_returning():
-            with torch.no_grad():
-                return adapter.fn(q, k, v, cfg.causal, softmax_scale)
-
-        fwd_residual_mb = _measure_fwd_residual_mb(fwd_returning)
-
-        # Saved-for-backward memory: rerun forward with grad enabled and
-        # measure what's retained while the output (and its graph) is live.
+        # ===== timing pass 2: training step (fwd + bwd) =====
+        step_stats: Optional[TimingStats] = None
+        step_tf = float("nan")
         if want_bwd:
-            def fwd_with_grad():
-                return adapter.fn(q, k, v, cfg.causal, softmax_scale)
-            fwd_saved_mb = _measure_fwd_saved_mb(fwd_with_grad)
-        else:
-            fwd_saved_mb = float("nan")
-
-        bwd_stats: Optional[TimingStats] = None
-        bwd_tf = float("nan")
-        bwd_peak_mb = float("nan")
-
-        if want_bwd:
-            # Rebuild inputs with grads so each backward call has fresh leaves.
-            # We pay the construction cost once and zero grads between iters.
-            def bwd_step():
+            def step():
                 if q.grad is not None:
                     q.grad = None
                 if k.grad is not None:
@@ -339,43 +338,66 @@ def time_kernel(
                 out = adapter.fn(q, k, v, cfg.causal, softmax_scale)
                 out.backward(grad_out)
 
-            # We can't separately time backward without re-running forward
-            # (since the autograd graph is consumed). Common practice: time
-            # fwd+bwd together, then subtract median forward. We instead time
-            # full step ("fwd+bwd") and report bwd_ms = step_ms - fwd_ms; this
-            # matches the FA paper's reporting.
             _warmup_with_leak_check(
-                bwd_step, warmup,
+                step, warmup,
                 on_leak=_on_leak("step"),
                 threshold_mb=leak_threshold_mb,
             )
-            step_samples = _time_iters(bwd_step, iters)
+            step_samples = _time_iters(step, iters)
             step_stats = TimingStats.from_samples(step_samples)
-            # Per-iter subtraction would be noisier; use median of step minus
-            # median of fwd, clamped at 0.
-            bwd_median = max(step_stats.median_ms - fwd_stats.median_ms, 0.0)
-            # For std/percentiles, fall back to step stats minus fwd median.
-            bwd_samples = [max(s - fwd_stats.median_ms, 0.0) for s in step_samples]
-            bwd_stats = TimingStats.from_samples(bwd_samples)
-            bwd_stats.median_ms = bwd_median  # type: ignore[misc]
+            step_tf = tflops_per_sec(fwd_flops_val + bwd_flops_val, step_stats.median_ms)
 
-            bwd_flops_val = bwd_flops(cfg.batch, cfg.seqlen, cfg.nheads, cfg.head_dim, cfg.causal)
-            bwd_tf = tflops_per_sec(bwd_flops_val, bwd_stats.median_ms)
+        # ===== memory pass (untimed): three independent probes =====
+        # Each probe is followed by empty_cache + grad reset to keep the
+        # next measurement isolated.
+        def _reset_grads():
+            if q.grad is not None: q.grad = None
+            if k.grad is not None: k.grad = None
+            if v.grad is not None: v.grad = None
 
-            # Peak memory for a full fwd+bwd step (includes activations
-            # retained for autograd plus grad buffers).
-            bwd_peak_mb = _measure_peak_mem_mb(bwd_step)
+        # (a) forward peak with grad enabled (training-forward memory).
+        def fwd_with_grad_no_keep():
+            _ = adapter.fn(q, k, v, cfg.causal, softmax_scale)
+        if want_bwd:
+            fwd_peak_mb = _measure_peak_mem_mb(fwd_with_grad_no_keep)
+        else:
+            fwd_peak_mb = _measure_peak_mem_mb(fwd_inference)
+        torch.cuda.empty_cache()
+        _reset_grads()
+
+        # (b) memory retained for backward: forward with grad on, output kept
+        #     alive across the snapshot so its autograd graph + saved tensors
+        #     (including framework-foreign VJP closures) count.
+        if want_bwd:
+            def fwd_returning_with_grad():
+                return adapter.fn(q, k, v, cfg.causal, softmax_scale)
+            fwd_saved_mb = _measure_fwd_saved_mb(fwd_returning_with_grad)
+        else:
+            fwd_saved_mb = float("nan")
+        torch.cuda.empty_cache()
+        _reset_grads()
+
+        # (c) full fwd+bwd peak.
+        if want_bwd:
+            def step_for_mem():
+                _reset_grads()
+                out = adapter.fn(q, k, v, cfg.causal, softmax_scale)
+                out.backward(grad_out)
+            bwd_peak_mb = _measure_peak_mem_mb(step_for_mem)
+        else:
+            bwd_peak_mb = float("nan")
+        torch.cuda.empty_cache()
+        _reset_grads()
 
         return Result(
             kernel=adapter.name,
             config=cfg,
             status="ok",
-            fwd=fwd_stats,
-            bwd=bwd_stats,
-            fwd_tflops=fwd_tf,
-            bwd_tflops=bwd_tf,
+            fwd_inference=fwd_inf_stats,
+            step=step_stats,
+            fwd_inference_tflops=fwd_inf_tf,
+            step_tflops=step_tf,
             fwd_peak_mem_mb=fwd_peak_mb,
-            fwd_residual_mem_mb=fwd_residual_mb,
             fwd_saved_mem_mb=fwd_saved_mb,
             bwd_peak_mem_mb=bwd_peak_mb,
         )

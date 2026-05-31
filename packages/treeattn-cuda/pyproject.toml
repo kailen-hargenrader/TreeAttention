@@ -1,0 +1,17 @@
+[project]
+name = "treeattn-cuda"
+version = "0.1.0"
+description = "Custom tree attention kernels targeting CUDA, with a staged PyTorch autograd fallback."
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "ninja",
+    "torch==2.7.1",
+    "treeattn-torch",
+]
+
+[tool.uv.sources]
+treeattn-torch = { workspace = true }
+
+[build-system]
+requires = ["uv_build>=0.11.15,<0.12.0"]
+build-backend = "uv_build"

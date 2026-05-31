@@ -180,34 +180,31 @@ def _make_sweep(args: argparse.Namespace) -> list[BenchConfig]:
 
 def _series_from_results(
     results: list[Result], label: str, adapter_name: str,
-) -> tuple[list[int], list[float], list[float], list[float], list[float], list[float], list[float]]:
-    """Return (seqlens, fwd_ms, bwd_ms, fwd_peak_mb, fwd_resid_mb, fwd_saved_mb, bwd_peak_mb)
+) -> tuple[list[int], list[float], list[float], list[float], list[float], list[float]]:
+    """Return (seqlens, fwd_inference_ms, step_ms, fwd_peak_mb, fwd_saved_mb, bwd_peak_mb)
     for one kernel, keeping only ``status=="ok"`` cells.
     """
     seqs: list[int] = []
-    fwds: list[float] = []
-    bwds: list[float] = []
+    infs: list[float] = []
+    steps: list[float] = []
     fwd_peaks: list[float] = []
-    fwd_resids: list[float] = []
     fwd_saveds: list[float] = []
     bwd_peaks: list[float] = []
     for r in results:
         if r.kernel != adapter_name or r.status != "ok":
             continue
         seqs.append(r.config.seqlen)
-        fwds.append(r.fwd.median_ms if r.fwd else float("nan"))
-        bwds.append(r.bwd.median_ms if r.bwd else float("nan"))
+        infs.append(r.fwd_inference.median_ms if r.fwd_inference else float("nan"))
+        steps.append(r.step.median_ms if r.step else float("nan"))
         fwd_peaks.append(r.fwd_peak_mem_mb)
-        fwd_resids.append(r.fwd_residual_mem_mb)
         fwd_saveds.append(r.fwd_saved_mem_mb)
         bwd_peaks.append(r.bwd_peak_mem_mb)
     order = sorted(range(len(seqs)), key=lambda i: seqs[i])
     return (
         [seqs[i] for i in order],
-        [fwds[i] for i in order],
-        [bwds[i] for i in order],
+        [infs[i] for i in order],
+        [steps[i] for i in order],
         [fwd_peaks[i] for i in order],
-        [fwd_resids[i] for i in order],
         [fwd_saveds[i] for i in order],
         [bwd_peaks[i] for i in order],
     )
@@ -228,15 +225,15 @@ def _plot(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    # Panels: fwd time, [bwd time], fwd peak mem, fwd residual mem, [bwd peak mem]
-    panels: list[tuple[str, str, int]] = [("Forward time", "ms", 1)]
+    # Panels: inference time, [training step time], fwd peak mem,
+    # fwd saved-for-backward mem, [bwd peak mem].
+    panels: list[tuple[str, str, int]] = [("Inference time", "ms", 1)]
     if do_backward:
-        panels.append(("Backward time", "ms", 2))
+        panels.append(("Training step time", "ms", 2))
     panels.append(("Forward peak memory", "MiB", 3))
-    panels.append(("Forward residual memory", "MiB", 4))
-    panels.append(("Forward saved for backward", "MiB", 5))
+    panels.append(("Forward saved for backward", "MiB", 4))
     if do_backward:
-        panels.append(("Backward peak memory", "MiB", 6))
+        panels.append(("Backward peak memory", "MiB", 5))
 
     n = len(panels)
     ncols = min(n, 3)
@@ -249,16 +246,15 @@ def _plot(
     cmap = plt.get_cmap("tab10")
     for i, (label, adapter) in enumerate(labeled):
         color = cmap(i % 10)
-        seqs, fwds, bwds, fwd_peaks, fwd_resids, fwd_saveds, bwd_peaks = _series_from_results(
+        seqs, infs, steps, fwd_peaks, fwd_saveds, bwd_peaks = _series_from_results(
             results, label, adapter.name,
         )
         if not seqs:
             continue
         series_by_panel = {
-            "Forward time": (fwds, "o", "-"),
-            "Backward time": (bwds, "s", "--"),
+            "Inference time": (infs, "o", "-"),
+            "Training step time": (steps, "s", "--"),
             "Forward peak memory": (fwd_peaks, "o", "-"),
-            "Forward residual memory": (fwd_resids, "^", "-"),
             "Forward saved for backward": (fwd_saveds, "D", "-"),
             "Backward peak memory": (bwd_peaks, "s", "--"),
         }
@@ -270,11 +266,7 @@ def _plot(
         if log_x:
             ax.set_xscale("log", base=2)
         if log_y:
-            if panel_name == "Forward residual memory":
-                # symlog so zero-residual kernels still render.
-                ax.set_yscale("symlog", linthresh=1.0)
-            else:
-                ax.set_yscale("log")
+            ax.set_yscale("log")
         ax.set_xlabel("Sequence length")
         ax.set_ylabel(f"{'Time' if unit == 'ms' else 'Memory'} ({unit})")
         ax.set_title(panel_name)
@@ -343,10 +335,10 @@ def main(argv: list[str] | None = None) -> int:
 
     def on_result(r: Result) -> None:
         marker = {"ok": "✓", "oom": "OOM", "skipped": "skip", "error": "ERR"}.get(r.status, r.status)
-        fwd = r.fwd.median_ms if r.fwd else float("nan")
-        bwd = r.bwd.median_ms if r.bwd else float("nan")
+        inf = r.fwd_inference.median_ms if r.fwd_inference else float("nan")
+        stp = r.step.median_ms if r.step else float("nan")
         print(f"  [{marker:>4}] {r.kernel:<24} s={r.config.seqlen:<6}  "
-              f"fwd={fwd:.3f}ms  bwd={bwd:.3f}ms"
+              f"inf={inf:.3f}ms  step={stp:.3f}ms"
               + (f"  ({r.skip_reason or r.error_msg})" if r.status != "ok" else ""))
 
     results = run_sweep(

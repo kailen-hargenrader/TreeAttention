@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Tree Attention vs Standard Attention</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<link rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css"
+      integrity="sha384-nB0miv6/jRmo5UMMR1wu3Gz6NLsoTkbqJghGIsx//Rlm+ZU03BU6SQNC66uf4l5+"
+      crossorigin="anonymous" />
+<script defer
+        src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"
+        integrity="sha384-7zkQWkzuo3B5mTepMUcHkMB5jZaolc2xDwL6VFqjFALcbeS9Ggm/Yr2r3Dy4lfFg"
+        crossorigin="anonymous"></script>
+<script defer
+        src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+        integrity="sha384-43gviWU0YVjaDtb/GhzOouOXtZMP/7XUzwPTstBeZFe/+rCMvRwr4yROQP43s0Xk"
+        crossorigin="anonymous"
+        onload="renderMathInElement(document.body,{
+          delimiters:[
+            {left:'$$',right:'$$',display:true},
+            {left:'$',right:'$',display:false}
+          ]
+        });"></script>
+<style>
+  :root {
+    --bg: #0e1116;
+    --fg: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --accent2: #f0883e;
+    --code-bg: #161b22;
+    --rule: #30363d;
+  }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--fg);
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    overflow: hidden;
+  }
+  .deck { position: relative; width: 100vw; height: 100vh; }
+  .slide {
+    position: absolute; inset: 0;
+    padding: 4vh 6vw;
+    box-sizing: border-box;
+    display: none;
+    flex-direction: column;
+    overflow: auto;
+  }
+  .slide.active { display: flex; }
+  h1 { font-size: 2.4rem; margin: 0 0 0.4em 0; color: var(--accent); }
+  h2 { font-size: 1.8rem; margin: 0 0 0.6em 0; color: var(--accent); }
+  h3 { font-size: 1.2rem; margin: 0.4em 0; color: var(--accent2); }
+  p, li { font-size: 1.15rem; line-height: 1.5; }
+  ul { padding-left: 1.4em; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: var(--code-bg); padding: 1px 4px; border-radius: 3px;
+    font-size: 0.95em;
+  }
+  pre {
+    background: var(--code-bg); padding: 12px 14px; border-radius: 6px;
+    overflow: auto; font-size: 0.95rem; line-height: 1.4;
+    border: 1px solid var(--rule);
+  }
+  table { border-collapse: collapse; margin: 0.6em 0; }
+  th, td { border: 1px solid var(--rule); padding: 6px 12px; text-align: left; }
+  th { background: var(--code-bg); color: var(--accent); }
+  .footer {
+    position: fixed; bottom: 1.2vh; left: 0; right: 0;
+    display: flex; justify-content: space-between;
+    padding: 0 2vw; color: var(--muted); font-size: 0.9rem;
+    pointer-events: none;
+  }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 2vw; }
+  .col { min-width: 0; }
+  .center { text-align: center; }
+  svg { display: block; margin: 0 auto; max-width: 100%; }
+  .pill {
+    display: inline-block; padding: 1px 8px; border-radius: 999px;
+    background: var(--code-bg); border: 1px solid var(--rule);
+    color: var(--muted); font-size: 0.85em;
+  }
+  .accent { color: var(--accent); }
+  .accent2 { color: var(--accent2); }
+  .muted { color: var(--muted); }
+  .grow { flex: 1 1 auto; min-height: 0; }
+  .katex-display { margin: 0.6em 0 !important; }
+</style>
+</head>
+<body>
+<div class="deck" id="deck">
+
+<!-- Slide 1: Title -->
+<section class="slide">
+  <h1>Tree Attention</h1>
+  <h2 style="color: var(--fg)">vs. Standard (Softmax) Attention</h2>
+  <p class="muted">A walkthrough of how this repo's hierarchical attention kernels compute attention weights, where they diverge from the standard formulation, and what that costs.</p>
+  <p class="muted">Use <span class="pill">→ / Space</span> to advance, <span class="pill">←</span> to go back.</p>
+</section>
+
+<!-- Slide 2: Standard attention recap -->
+<section class="slide">
+  <h2>Standard attention, in one line</h2>
+  <p>Given $N$ key/value pairs, each query $q$ attends to every value:</p>
+  $$ \mathrm{Attn}(q, K, V) = \mathrm{softmax}\!\left(\frac{q K^\top}{\sqrt{d}}\right) V $$
+  <ul>
+    <li>Logits are computed for <em>all $N$ keys</em>, then normalized globally by softmax.</li>
+    <li>Per query: $O(N)$ dot products, $O(N)$ memory for weights.</li>
+    <li>FlashAttention-style kernels stream this in tiles to avoid materializing the $L \times N$ weight matrix, but the algorithm is unchanged.</li>
+  </ul>
+</section>
+
+<!-- Slide 3: Tree setup -->
+<section class="slide">
+  <h2>Tree attention's setup</h2>
+  <div class="cols">
+    <div class="col">
+      <ul>
+        <li>$N$ values sit at the <strong>leaves</strong> of a complete binary tree.</li>
+        <li>$K = N-1$ <strong>internal-node keys</strong> sit at branch points.</li>
+        <li>For each query, the attention weight on a leaf is the probability of <strong>walking the tree</strong> from root to that leaf, where each branch is decided by a sigmoid of $\langle q, k_{\text{node}}\rangle$.</li>
+      </ul>
+    </div>
+    <div class="col center">
+      <svg viewBox="0 0 360 240" width="360">
+        <g stroke="#8b949e" stroke-width="1" fill="none">
+          <line x1="180" y1="30" x2="100" y2="90"/>
+          <line x1="180" y1="30" x2="260" y2="90"/>
+          <line x1="100" y1="90" x2="60" y2="150"/>
+          <line x1="100" y1="90" x2="140" y2="150"/>
+          <line x1="260" y1="90" x2="220" y2="150"/>
+          <line x1="260" y1="90" x2="300" y2="150"/>
+          <line x1="60"  y1="150" x2="40"  y2="210"/>
+          <line x1="60"  y1="150" x2="80"  y2="210"/>
+          <line x1="140" y1="150" x2="120" y2="210"/>
+          <line x1="140" y1="150" x2="160" y2="210"/>
+          <line x1="220" y1="150" x2="200" y2="210"/>
+          <line x1="220" y1="150" x2="240" y2="210"/>
+          <line x1="300" y1="150" x2="280" y2="210"/>
+          <line x1="300" y1="150" x2="320" y2="210"/>
+        </g>
+        <g font-family="monospace" font-size="11" text-anchor="middle">
+          <!-- internal keys -->
+          <circle cx="180" cy="30"  r="13" fill="#1f6feb"/>
+          <text x="180" y="34" fill="white">k₀</text>
+          <circle cx="100" cy="90"  r="13" fill="#1f6feb"/>
+          <text x="100" y="94" fill="white">k₁</text>
+          <circle cx="260" cy="90"  r="13" fill="#1f6feb"/>
+          <text x="260" y="94" fill="white">k₂</text>
+          <circle cx="60"  cy="150" r="13" fill="#1f6feb"/>
+          <text x="60"  y="154" fill="white">k₃</text>
+          <circle cx="140" cy="150" r="13" fill="#1f6feb"/>
+          <text x="140" y="154" fill="white">k₄</text>
+          <circle cx="220" cy="150" r="13" fill="#1f6feb"/>
+          <text x="220" y="154" fill="white">k₅</text>
+          <circle cx="300" cy="150" r="13" fill="#1f6feb"/>
+          <text x="300" y="154" fill="white">k₆</text>
+          <!-- leaves -->
+          <g fill="#f0883e">
+            <rect x="30"  y="200" width="20" height="20" rx="3"/>
+            <rect x="70"  y="200" width="20" height="20" rx="3"/>
+            <rect x="110" y="200" width="20" height="20" rx="3"/>
+            <rect x="150" y="200" width="20" height="20" rx="3"/>
+            <rect x="190" y="200" width="20" height="20" rx="3"/>
+            <rect x="230" y="200" width="20" height="20" rx="3"/>
+            <rect x="270" y="200" width="20" height="20" rx="3"/>
+            <rect x="310" y="200" width="20" height="20" rx="3"/>
+          </g>
+          <g fill="white">
+            <text x="40"  y="214">v₀</text>
+            <text x="80"  y="214">v₁</text>
+            <text x="120" y="214">v₂</text>
+            <text x="160" y="214">v₃</text>
+            <text x="200" y="214">v₄</text>
+            <text x="240" y="214">v₅</text>
+            <text x="280" y="214">v₆</text>
+            <text x="320" y="214">v₇</text>
+          </g>
+        </g>
+      </svg>
+      <p class="muted" style="font-size:0.95rem">$N=8$ leaves, $K=7$ internal keys, depth $\log_2 N = 3$.</p>
+    </div>
+  </div>
+</section>
+
+<!-- Slide 4: Path probability -->
+<section class="slide">
+  <h2>The weight on one leaf is a <em>path product</em></h2>
+  <p>For leaf $i$, let $\text{path}(i) = (n_0, n_1, \dots, n_{L-1})$ be the internal-node keys on its root-to-leaf path, and $b_\ell \in \{0, 1\}$ the bit telling us whether the path goes <em>left</em> (0) or <em>right</em> (1) at level $\ell$. Define</p>
+  $$ s_\ell \;=\; \langle q,\, k_{n_\ell}\rangle, \qquad p_\ell \;=\; \begin{cases} \sigma(-s_\ell) & b_\ell = 0 \;(\text{left}) \\ \sigma(+s_\ell) & b_\ell = 1 \;(\text{right}) \end{cases} $$
+  <p>Then the attention weight on leaf $i$ is the product</p>
+  $$ w_i \;=\; \prod_{\ell=0}^{L-1} p_\ell \;=\; \exp\!\Bigg(\sum_{\ell=0}^{L-1} \log \sigma\big((2b_\ell - 1)\, s_\ell\big)\Bigg). $$
+  <p class="muted">This is exactly what <code>tree_attention_deterministic_weights</code> in the JAX kernel computes, level by level inside a <code>lax.scan</code>.</p>
+</section>
+
+<!-- Slide 5: Why weights sum to 1 -->
+<section class="slide">
+  <h2>Weights sum to 1 — for free</h2>
+  <p>At every internal node, $\sigma(-s) + \sigma(+s) = 1$. The two children of any node split the parent's mass exactly. So:</p>
+  $$ \sum_{i=1}^{N} w_i \;=\; 1 \quad\text{by construction.} $$
+  <ul>
+    <li><strong>Standard attention</strong> reaches $\sum w_i = 1$ via a global softmax — a single nonlocal normalization.</li>
+    <li><strong>Tree attention</strong> reaches it via $\log_2 N$ <em>local</em> sigmoid decisions. No global normalization, no cross-key reduction.</li>
+  </ul>
+  <p>This is the structural reason tree attention can be sampled cheaply (next slide).</p>
+</section>
+
+<!-- Slide 6: Deterministic mode -->
+<section class="slide">
+  <h2>Deterministic mode: enumerate all $N$ paths</h2>
+  <p>Run the level-by-level recursion <em>without</em> branching — accumulate log-probs over a tensor of shape $L \times B \times H \times P$, doubling $P$ each level until $P = N$:</p>
+<pre><code>log_path_probs = zeros(L, B, H, 1)
+for d in range(log_N):
+    k_d  = k[(1<<d) - 1 : (1<<(d+1)) - 1]                # this level's keys
+    dots = einsum(q, k_d, "l b h d, n b h d -> l b h n")
+    logp = stack([logsigmoid(dots), logsigmoid(-dots)])  # left / right
+    log_path_probs = log_path_probs[..., None] + logp    # broadcast & double
+    log_path_probs = rearrange("l b h p two -> l b h (p two)")
+
+attn_weights = exp(log_path_probs)                        # (L, B, H, N)
+output       = einsum(attn_weights, v, "l b h n, n b h d -> l b h d")</code></pre>
+  <p>Same answer as exhaustively walking every leaf. Cost: $\Theta(L\,N)$ FLOPs and a dense $(L, N)$ weight matrix — same asymptotics as standard attention, no savings.</p>
+</section>
+
+<!-- Slide 7: Stochastic mode -->
+<section class="slide">
+  <h2>Stochastic mode: Gumbel-max walk</h2>
+  <p>Instead of evaluating every leaf, sample $S$ root-to-leaf paths per query. At each level, draw the branch with Gumbel-max:</p>
+  $$ b \;=\; \arg\max\Big(\log p_\text{left} + g_0,\; \log p_\text{right} + g_1\Big), \quad g_j \sim \mathrm{Gumbel}(0,1). $$
+  <ul>
+    <li>$\log_2 N$ levels &times; $S$ paths &times; one dot-product per level = <strong>$O(S \log N)$</strong> work and memory per query.</li>
+    <li>Approximates exact tree-attention output; bias controlled by $S$.</li>
+  </ul>
+  <p>This is the regime where tree attention is supposed to <em>beat</em> standard attention asymptotically. (See the bench plot — fwd time grows much more slowly than $L$ in stochastic mode.)</p>
+</section>
+
+<!-- Slide 8: Causal mode -->
+<section class="slide">
+  <h2>Causal masking is harder than in standard attention</h2>
+  <div class="cols">
+    <div class="col">
+      <h3>Standard</h3>
+      <p>Set logits with $i &gt; t$ to $-\infty$ before the softmax. One mask, done.</p>
+      <h3>Tree</h3>
+      <p>Truncating leaves can leave a <em>partial</em> subtree at the boundary whose mass would no longer sum to 1. Need a two-pass correction:</p>
+      <ol>
+        <li><strong>Bottom-up:</strong> walk the boundary path from leaves up, computing the corrected log-mass of each ancestor (mixing on-path and off-path subtrees).</li>
+        <li><strong>Top-down:</strong> re-sample / re-evaluate using the corrected masses on the boundary path; off-boundary nodes use the regular $\sigma(\pm s)$.</li>
+      </ol>
+    </div>
+    <div class="col">
+      <pre><code># pseudo-pseudocode (per query t)
+boundary = path_to(t)            # log_N internal nodes
+log_mass[depth-1..0] from leaves up:
+    L, R = subtrees of node at depth d
+    if path goes left at d:
+        on  = mass(L); off = -inf
+    else:
+        on  = mass(R); off = log(N_L)
+    log_mass[d] = logsumexp(
+        on  + logσ(±s_d),
+        off + logσ(∓s_d))
+
+then sample top-down,
+using corrected sigmoids on boundary
+and raw sigmoids elsewhere.</code></pre>
+      <p class="muted">Implementation: <code>_sample_paths_causal</code>. The hybrid mode evaluates the first $S$ queries deterministically and only samples the rest.</p>
+    </div>
+  </div>
+</section>
+
+<!-- Slide 9: Complexity table -->
+<section class="slide">
+  <h2>Where the costs differ</h2>
+  <table>
+    <thead><tr>
+      <th>Quantity</th>
+      <th>Standard (FlashAttn)</th>
+      <th>Tree, deterministic</th>
+      <th>Tree, stochastic ($S$ paths)</th>
+    </tr></thead>
+    <tbody>
+      <tr><td>Forward FLOPs / query</td>     <td>$O(N)$</td>          <td>$O(N)$</td>             <td>$O(S \log N)$</td></tr>
+      <tr><td>Forward memory / query</td>    <td>$O(1)$ (streamed)</td><td>$O(N)$ (dense weights)</td><td>$O(S)$</td></tr>
+      <tr><td>Saved-for-backward</td>        <td>$O(L)$ (logsumexp)</td><td>$O(L\,N)$ weights</td>  <td>$O(L\,S)$ + path indices</td></tr>
+      <tr><td>Backward FLOPs / query</td>    <td>$O(N)$ recomputed</td><td>$O(N)$ from saved $w$</td><td>$O(S \log N)$</td></tr>
+      <tr><td>Normalization</td>             <td>global softmax</td>  <td>product of sigmoids</td>  <td>product of sigmoids</td></tr>
+      <tr><td>Causal mask</td>               <td>1-line $-\infty$</td><td>boundary-path correction</td><td>two-pass sampler</td></tr>
+    </tbody>
+  </table>
+  <p class="muted">The promise: stochastic-mode tree attention scales <em>sub-linearly</em> in $N$. The catch: deterministic-mode tree attention has the same asymptotics as standard attention but loses the FlashAttention-style streaming.</p>
+</section>
+
+<!-- Slide 10: Bench reality -->
+<section class="slide">
+  <h2>What this looks like in the harness</h2>
+  <ul>
+    <li><strong>flash_attn_2 / sdpa_efficient:</strong> the streaming softmax baseline; sub-millisecond at 16k, MiB-scale memory.</li>
+    <li><strong>treeattn_torch (deterministic):</strong> materializes the $(L, N)$ weight matrix and saves it for backward — that's the multi-GiB <code>fwd_saved_mem_mb</code> column you saw, and a $\Theta(L\,N)$ backward that explodes by 32k.</li>
+    <li><strong>treeattn_jax (deterministic):</strong> forward uses a memory-light <code>scan</code>, but reverse-mode AD through <code>vmap</code>-of-<code>scan</code> materializes a $[B, H, L, N{-}1, D]$ transient at backward time. OOMs around 8k–16k even though forward saves "only" ~1 GiB.</li>
+    <li>Neither current implementation realizes the asymptotic stochastic-mode promise without further work (a custom VJP, blocked deterministic kernel, or <code>jax.checkpoint</code> on the scan).</li>
+  </ul>
+</section>
+
+<!-- Slide 11: Summary -->
+<section class="slide">
+  <h2>One-slide summary</h2>
+  <ul>
+    <li>Standard attention: <strong>one global softmax</strong> over $N$ logits.</li>
+    <li>Tree attention: <strong>$\log_2 N$ local sigmoids</strong> along a binary path. Weights sum to 1 by construction, no normalization needed.</li>
+    <li>Deterministic mode = exhaustive tree walk = same asymptotics as standard attention.</li>
+    <li>Stochastic mode = Gumbel-max sample of $S$ paths = $O(S \log N)$ — the actual win.</li>
+    <li>Causal masking is non-trivial: needs a boundary-path log-mass correction.</li>
+    <li>Backward is the bottleneck in the current implementations; both kernels save (or re-derive) tensors that grow with $L \cdot N$.</li>
+  </ul>
+</section>
+
+</div>
+
+<div class="footer">
+  <span id="slide-num">1 / ?</span>
+  <span class="muted">→ next · ← prev</span>
+</div>
+
+<script>
+  const slides = Array.from(document.querySelectorAll('.slide'));
+  let idx = 0;
+  function show(i) {
+    idx = Math.max(0, Math.min(slides.length - 1, i));
+    slides.forEach((s, j) => s.classList.toggle('active', j === idx));
+    document.getElementById('slide-num').textContent = `${idx + 1} / ${slides.length}`;
+    history.replaceState(null, '', '#' + (idx + 1));
+  }
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') { show(idx + 1); e.preventDefault(); }
+    else if (e.key === 'ArrowLeft' || e.key === 'PageUp') { show(idx - 1); e.preventDefault(); }
+    else if (e.key === 'Home') { show(0); }
+    else if (e.key === 'End') { show(slides.length - 1); }
+  });
+  document.addEventListener('click', e => {
+    if (e.target.closest('a, pre, code, table')) return;
+    const half = window.innerWidth / 2;
+    show(idx + (e.clientX > half ? 1 : -1));
+  });
+  const initial = parseInt(location.hash.slice(1)) || 1;
+  show(initial - 1);
+</script>
+</body>
+</html>
