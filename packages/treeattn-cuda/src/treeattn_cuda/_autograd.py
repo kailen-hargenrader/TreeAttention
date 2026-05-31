@@ -399,7 +399,7 @@ def _scatter_weighted_grad_v(
         grad_output.is_cuda
         and sampled_indices.is_cuda
         and attn_weights.is_cuda
-        and grad_output.dtype == torch.float32
+        and grad_output.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and attn_weights.dtype == torch.float32
     ):
         native_output = _native.scatter_weighted_grad_v_forward(
@@ -515,7 +515,7 @@ def _accumulate_qk_non_causal_all_depths_inplace(
         and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and grad_log_probs.dtype == torch.float32
         and grad_q_out.dtype == torch.float32
-        and grad_k_out.dtype == torch.float32
+        and grad_k_out.dtype in (q.dtype, torch.float32)
     ):
         used_native = _native.accumulate_qk_non_causal_all_depths_inplace(
             q.contiguous(),
@@ -603,14 +603,12 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
         num_leaves = v.shape[0]
         k_len = k.shape[0]
         accum_dtype = _accum_dtype(q.dtype)
-        v_accum = v.to(accum_dtype)
-        grad_out_accum = grad_output.to(accum_dtype)
         q_accum: torch.Tensor | None = None
         k_accum: torch.Tensor | None = None
 
-        grad_q = torch.zeros_like(q, dtype=accum_dtype)
+        grad_q = torch.zeros_like(q)
         grad_k = torch.zeros_like(k, dtype=accum_dtype)
-        grad_v = torch.zeros_like(v_accum)
+        grad_v = torch.zeros_like(v)
 
         def _ensure_qk_accum() -> tuple[torch.Tensor, torch.Tensor]:
             nonlocal q_accum, k_accum
@@ -620,12 +618,18 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
                 k_accum = k.to(accum_dtype)
             return q_accum, k_accum
 
+        def _ensure_grad_v_accum() -> torch.Tensor:
+            nonlocal grad_v
+            if grad_v.dtype != accum_dtype:
+                grad_v = grad_v.to(accum_dtype)
+            return grad_v
+
         if num_leaves == 0:
-            return grad_q.to(q.dtype), grad_k.to(k.dtype), grad_v.to(v.dtype), None, None, None
+            return grad_q, grad_k.to(k.dtype), grad_v.to(v.dtype), None, None, None
 
         if num_leaves == 1:
-            grad_v[0] = grad_out_accum.sum(dim=0)
-            return grad_q.to(q.dtype), grad_k.to(k.dtype), grad_v.to(v.dtype), None, None, None
+            _ensure_grad_v_accum()[0] = grad_output.to(accum_dtype).sum(dim=0)
+            return grad_q, grad_k.to(k.dtype), grad_v.to(v.dtype), None, None, None
 
         sampled_indices, path_log_probs = _replay_non_causal_paths(
             q,
@@ -636,7 +640,7 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
         )
         attn_weights = _softmax_path_log_probs_inplace(path_log_probs)
         grad_v_native = _scatter_weighted_grad_v(
-            grad_out_accum,
+            grad_output,
             sampled_indices,
             attn_weights,
             num_leaves=num_leaves,
@@ -647,23 +651,25 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
         for start in range(0, q.shape[0], block_size):
             stop = min(start + block_size, q.shape[0])
             q_block = q[start:stop]
-            grad_out_block = grad_out_accum[start:stop]
+            grad_out_block = grad_output[start:stop]
+            grad_out_block_accum = grad_out_block.to(accum_dtype)
             idx_block = sampled_indices[start:stop]
             attn_block = attn_weights[start:stop]
 
-            gathered_values = _gather_tree_values(v_accum, idx_block)
-            grad_attn = (grad_out_block.unsqueeze(-2) * gathered_values).sum(dim=-1)
+            gathered_values = _gather_tree_values(v, idx_block).to(accum_dtype)
+            grad_attn = (grad_out_block_accum.unsqueeze(-2) * gathered_values).sum(dim=-1)
             grad_log_probs = attn_block * (
                 grad_attn - (attn_block * grad_attn).sum(dim=-1, keepdim=True)
             )
 
             if grad_v_native is None:
-                grad_v_updates = attn_block.unsqueeze(-1) * grad_out_block.unsqueeze(-2)
-                grad_v = grad_v + _scatter_tree_updates(
+                grad_v_accum = _ensure_grad_v_accum()
+                grad_v_updates = attn_block.unsqueeze(-1) * grad_out_block_accum.unsqueeze(-2)
+                grad_v = grad_v_accum + _scatter_tree_updates(
                     num_leaves, idx_block, grad_v_updates
                 )
 
-            grad_q_block = torch.zeros_like(grad_out_block)
+            grad_q_block = torch.zeros_like(grad_out_block, dtype=accum_dtype)
             used_full_native_qk = _accumulate_qk_non_causal_all_depths_inplace(
                 q_block,
                 k,
@@ -737,9 +743,9 @@ class _StochasticNonCausalTreeAttention(torch.autograd.Function):
                     if depth + 1 < log_n:
                         node_idx = 2 * node_idx + 1 + bit
 
-            grad_q[start:stop] = grad_q_block
+            grad_q[start:stop] = grad_q_block.to(q.dtype)
 
-        return grad_q.to(q.dtype), grad_k.to(k.dtype), grad_v.to(v.dtype), None, None, None
+        return grad_q, grad_k.to(k.dtype), grad_v.to(v.dtype), None, None, None
 
 
 def hierarchical_attention(

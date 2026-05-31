@@ -1,4 +1,5 @@
 #include <ATen/AccumulateType.h>
+#include <ATen/cuda/Atomic.cuh>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
@@ -22,7 +23,6 @@ int64_t compute_log_n_host(int64_t num_leaves) {
   }
   return log_n;
 }
-
 template <typename scalar_t, typename acc_t>
 __global__ void accumulate_qk_non_causal_all_depths_inplace_kernel(
   const scalar_t* __restrict__ q,
@@ -89,6 +89,47 @@ __global__ void accumulate_qk_non_causal_all_depths_inplace_kernel(
 
 }  // namespace
 
+template <typename scalar_t, typename acc_t>
+void launch_accumulate_qk_non_causal_all_depths_inplace_kernel(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& packed_paths,
+    const torch::Tensor& grad_log_probs,
+    const torch::Tensor& grad_q_out,
+    const torch::Tensor& grad_k_out,
+    int64_t k_len,
+    int64_t batch,
+    int64_t nheads,
+    int64_t width,
+    int64_t num_queries,
+    int64_t num_samples,
+    int64_t path_bytes,
+    int64_t log_n,
+    float max_logit,
+    int blocks,
+    int threads) {
+  accumulate_qk_non_causal_all_depths_inplace_kernel<scalar_t, acc_t><<<
+      blocks,
+      threads,
+      0,
+      at::cuda::getDefaultCUDAStream()>>>(
+      q.data_ptr<scalar_t>(),
+      k.data_ptr<scalar_t>(),
+      packed_paths.data_ptr<uint8_t>(),
+      grad_log_probs.data_ptr<float>(),
+      grad_q_out.data_ptr<float>(),
+      grad_k_out.data_ptr<float>(),
+      k_len,
+      batch,
+      nheads,
+      width,
+      num_queries,
+      num_samples,
+      path_bytes,
+      log_n,
+      max_logit);
+}
+
 void accumulate_qk_non_causal_all_depths_inplace_cuda(
     const torch::Tensor& q,
     const torch::Tensor& k,
@@ -119,17 +160,13 @@ void accumulate_qk_non_causal_all_depths_inplace_cuda(
       "accumulate_qk_non_causal_all_depths_inplace_cuda",
       [&] {
         using acc_t = at::acc_type<scalar_t, true>;
-        accumulate_qk_non_causal_all_depths_inplace_kernel<scalar_t, acc_t><<<
-            blocks,
-            threads,
-            0,
-            at::cuda::getDefaultCUDAStream()>>>(
-            q.data_ptr<scalar_t>(),
-            k.data_ptr<scalar_t>(),
-            packed_paths.data_ptr<uint8_t>(),
-            grad_log_probs.data_ptr<float>(),
-            grad_q_out.data_ptr<float>(),
-            grad_k_out.data_ptr<float>(),
+        launch_accumulate_qk_non_causal_all_depths_inplace_kernel<scalar_t, acc_t>(
+            q,
+            k,
+            packed_paths,
+            grad_log_probs,
+            grad_q_out,
+            grad_k_out,
             k_len,
             batch,
             nheads,
@@ -138,7 +175,9 @@ void accumulate_qk_non_causal_all_depths_inplace_cuda(
             num_samples,
             path_bytes,
             log_n,
-            static_cast<float>(max_logit));
+            static_cast<float>(max_logit),
+            blocks,
+            threads);
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

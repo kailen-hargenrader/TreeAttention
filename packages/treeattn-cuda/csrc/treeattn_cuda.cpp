@@ -168,7 +168,9 @@ torch::Tensor scatter_weighted_grad_v_forward(
   TORCH_CHECK(grad_output.dim() == 4, "grad_output must have shape (L, B, H, D)");
   TORCH_CHECK(sampled_indices.dim() == 4, "sampled_indices must have shape (L, B, H, S)");
   TORCH_CHECK(attn_weights.dim() == 4, "attn_weights must have shape (L, B, H, S)");
-  TORCH_CHECK(grad_output.scalar_type() == torch::kFloat32, "grad_output must be float32");
+  TORCH_CHECK(
+      is_supported_treeattn_dtype(grad_output.scalar_type()),
+      "grad_output must be float32, float16, or bfloat16");
   TORCH_CHECK(attn_weights.scalar_type() == torch::kFloat32, "attn_weights must be float32");
   TORCH_CHECK(
       is_supported_treeattn_index_dtype(sampled_indices.scalar_type()),
@@ -269,9 +271,7 @@ void accumulate_qk_non_causal_inplace(
   TORCH_CHECK(grad_log_probs.scalar_type() == torch::kFloat32, "grad_log_probs must be float32");
   TORCH_CHECK(grad_q_out.scalar_type() == torch::kFloat32, "grad_q_out must be float32");
   TORCH_CHECK(grad_k_out.scalar_type() == torch::kFloat32, "grad_k_out must be float32");
-  TORCH_CHECK(current_nodes.sizes() == grad_log_probs.sizes(), "current_nodes and grad_log_probs must have the same shape");
-  TORCH_CHECK(q.size(0) == current_nodes.size(0), "query length must match current_nodes");
-  TORCH_CHECK(q.size(0) == grad_q_out.size(0), "query length must match grad_q_out");
+  TORCH_CHECK(grad_k_out.scalar_type() == torch::kFloat32, "grad_k_out must be float32");
   TORCH_CHECK(k.size(0) == grad_k_out.size(0), "key length must match grad_k_out");
   TORCH_CHECK(q.size(1) == k.size(1) && q.size(2) == k.size(2), "q and k batch/head dimensions must match");
   TORCH_CHECK(q.size(1) == grad_q_out.size(1) && q.size(2) == grad_q_out.size(2), "grad_q_out batch/head dimensions must match q");
@@ -320,7 +320,9 @@ void accumulate_qk_non_causal_all_depths_inplace(
   TORCH_CHECK(packed_paths.scalar_type() == torch::kUInt8, "packed_paths must be uint8");
   TORCH_CHECK(grad_log_probs.scalar_type() == torch::kFloat32, "grad_log_probs must be float32");
   TORCH_CHECK(grad_q_out.scalar_type() == torch::kFloat32, "grad_q_out must be float32");
-  TORCH_CHECK(grad_k_out.scalar_type() == torch::kFloat32, "grad_k_out must be float32");
+    TORCH_CHECK(
+      grad_k_out.scalar_type() == torch::kFloat32 || grad_k_out.scalar_type() == q.scalar_type(),
+      "grad_k_out must be float32 or match q/k dtype");
   TORCH_CHECK(q.size(0) == packed_paths.size(0), "query length must match packed_paths");
   TORCH_CHECK(q.size(0) == grad_log_probs.size(0), "query length must match grad_log_probs");
   TORCH_CHECK(q.size(0) == grad_q_out.size(0), "query length must match grad_q_out");

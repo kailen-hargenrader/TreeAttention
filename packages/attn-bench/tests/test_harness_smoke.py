@@ -331,6 +331,45 @@ def test_treeattn_cuda_native_grad_v_matches_python() -> None:
     torch.testing.assert_close(native_grad_v, python_grad_v)
 
 
+def test_treeattn_cuda_native_grad_v_supports_bf16(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TREEATTN_CUDA_BUILD", "1")
+    if not treeattn_cuda_native.has_native_kernels():
+        pytest.skip("treeattn_cuda native grad_v kernel not enabled")
+
+    torch.manual_seed(0)
+    grad_output = torch.randn((8, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
+    sampled_indices = torch.randint(0, 8, (8, 1, 2, 4), device="cuda", dtype=torch.int32)
+    attn_weights = torch.softmax(
+        torch.randn((8, 1, 2, 4), device="cuda", dtype=torch.float32),
+        dim=-1,
+    )
+
+    reset_runtime_stats()
+    native_grad_v = _scatter_weighted_grad_v(
+        grad_output,
+        sampled_indices,
+        attn_weights,
+        num_leaves=8,
+    )
+    assert native_grad_v is not None
+    stats = get_runtime_stats()
+
+    python_updates = attn_weights.unsqueeze(-1) * grad_output.to(torch.float32).unsqueeze(-2)
+    python_grad_v = _scatter_tree_updates(8, sampled_indices, python_updates)
+
+    assert stats["scatter_grad_v_native_calls"] > 0
+    assert stats["scatter_grad_v_python_calls"] == 0
+    assert native_grad_v.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        native_grad_v.to(torch.float32),
+        python_grad_v,
+        rtol=5e-3,
+        atol=5e-3,
+    )
+
+
 def test_treeattn_cuda_native_grad_logit_matches_python() -> None:
     if not treeattn_cuda_native.has_native_kernels():
         pytest.skip("treeattn_cuda native grad_logit kernel not enabled")
@@ -634,6 +673,37 @@ def test_treeattn_cuda_native_full_qk_accum_supports_bf16(monkeypatch: pytest.Mo
 
     torch.testing.assert_close(grad_q_native, grad_q_python)
     torch.testing.assert_close(grad_k_native, grad_k_python)
+
+
+    q_accum = q.to(torch.float32)
+    k_accum = k.to(torch.float32)
+    grad_q_python = torch.zeros_like(q_accum)
+    grad_k_python = torch.zeros_like(k_accum)
+    node_idx = torch.zeros((8, 1, 2, 4), device="cuda", dtype=torch.int64)
+    log_n = (k.shape[0] + 1).bit_length() - 1
+    for depth in range(log_n):
+        bit = ((packed_paths[..., depth // 8] >> (depth % 8)) & 1).to(torch.int64)
+        branch_sign = torch.where(bit == 0, 1.0, -1.0).to(torch.float32)
+        gathered_keys = torch.gather(
+            k_accum.permute(1, 2, 0, 3).contiguous().expand(8, 1, 2, 7, 16),
+            dim=-2,
+            index=node_idx.unsqueeze(-1).expand(8, 1, 2, 4, 16),
+        )
+        logits = (q_accum.unsqueeze(-2) * gathered_keys).sum(dim=-1).clamp(min=-1e3, max=1e3)
+        grad_logit = branch_sign * torch.sigmoid(-branch_sign * logits) * grad_log_probs
+        grad_q_python = grad_q_python + (grad_logit.unsqueeze(-1) * gathered_keys).sum(dim=-2)
+        grad_k_updates = grad_logit.unsqueeze(-1) * q_accum.unsqueeze(-2)
+        grad_k_python = grad_k_python + _scatter_tree_updates(7, node_idx, grad_k_updates)
+        if depth + 1 < log_n:
+            node_idx = 2 * node_idx + 1 + bit
+
+    torch.testing.assert_close(grad_q_native, grad_q_python)
+    torch.testing.assert_close(
+        grad_k_native.to(torch.float32),
+        grad_k_python,
+        rtol=2e-2,
+        atol=2e-2,
+    )
 
 
 def _assert_treeattn_cuda_matches_torch_reference(
