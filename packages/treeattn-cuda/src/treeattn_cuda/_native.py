@@ -28,6 +28,7 @@ def _load_extension():
     csrc_dir = package_root / "csrc"
     sources = [
         str(csrc_dir / "accumulate_qk_non_causal_all_depths.cu"),
+        str(csrc_dir / "accumulate_qk_non_causal_all_depths_prepared.cu"),
         str(csrc_dir / "accumulate_qk_non_causal.cu"),
         str(csrc_dir / "backward_prepare_non_causal.cu"),
         str(csrc_dir / "compute_grad_logit_non_causal.cu"),
@@ -52,6 +53,8 @@ def has_native_kernels() -> bool:
     extension = _load_extension()
     return extension is not None and hasattr(
         extension, "accumulate_qk_non_causal_all_depths_inplace"
+    ) and hasattr(
+        extension, "accumulate_qk_non_causal_all_depths_prepared_inplace"
     ) and hasattr(
         extension, "accumulate_qk_non_causal_inplace"
     ) and hasattr(
@@ -81,18 +84,46 @@ def replay_non_causal_paths_forward(q, k, packed_paths, max_logit):
     return extension.replay_non_causal_paths_forward(q, k, packed_paths, max_logit)
 
 
-def prepare_non_causal_backward(q, k, v, packed_paths, grad_output, max_logit):
+def prepare_non_causal_backward(q, k, packed_paths, max_logit):
     extension = _load_extension()
     if extension is None:
         return None
     return extension.prepare_non_causal_backward(
         q,
         k,
-        v,
         packed_paths,
-        grad_output,
         max_logit,
     )
+
+
+def accumulate_qk_non_causal_all_depths_prepared_inplace(
+    q,
+    k,
+    v,
+    grad_output,
+    sampled_indices,
+    attn_weights,
+    packed_paths,
+    max_logit,
+    grad_q_out,
+    grad_k_out,
+):
+    extension = _load_extension()
+    if extension is None:
+        return False
+    extension.accumulate_qk_non_causal_all_depths_prepared_inplace(
+        q,
+        k,
+        v,
+        grad_output,
+        sampled_indices,
+        attn_weights,
+        packed_paths,
+        max_logit,
+        grad_q_out,
+        grad_k_out,
+    )
+    return True
 
 
 def sample_non_causal_paths_forward(q, k, num_samples, block_size, max_logit):

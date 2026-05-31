@@ -25,8 +25,10 @@ from treeattn_cuda import (
 from treeattn_cuda import _native as treeattn_cuda_native
 from treeattn_cuda._autograd import (
     _accumulate_qk_non_causal_all_depths_inplace,
+    _accumulate_qk_non_causal_all_depths_prepared_inplace,
     _accumulate_qk_non_causal_inplace,
     _compute_grad_logit_non_causal,
+    _gather_tree_values,
     _prepare_non_causal_backward,
     _prepare_non_causal_backward_python,
     _replay_non_causal_paths,
@@ -219,8 +221,6 @@ def test_treeattn_cuda_native_prepare_backward_matches_python(
     torch.manual_seed(0)
     q = torch.randn((8, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((7, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
-    v = torch.randn((8, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
-    grad_output = torch.randn((8, 1, 2, 16), device="cuda", dtype=torch.bfloat16)
     _, _, packed_paths = _sample_paths_non_causal_streaming_python(
         q,
         k,
@@ -230,22 +230,18 @@ def test_treeattn_cuda_native_prepare_backward_matches_python(
     )
 
     reset_runtime_stats()
-    native_indices, native_attn, native_grad_log_probs = _prepare_non_causal_backward(
+    native_indices, native_attn = _prepare_non_causal_backward(
         q,
         k,
-        v,
         packed_paths,
-        grad_output,
         block_size=4,
         max_logit=1e3,
     )
     stats = get_runtime_stats()
-    python_indices, python_attn, python_grad_log_probs = _prepare_non_causal_backward_python(
+    python_indices, python_attn = _prepare_non_causal_backward_python(
         q,
         k,
-        v,
         packed_paths,
-        grad_output,
         block_size=4,
         max_logit=1e3,
     )
@@ -254,7 +250,76 @@ def test_treeattn_cuda_native_prepare_backward_matches_python(
     assert stats["prepare_backward_python_calls"] == 0
     assert torch.equal(native_indices, python_indices)
     torch.testing.assert_close(native_attn, python_attn)
-    torch.testing.assert_close(native_grad_log_probs, python_grad_log_probs)
+
+
+def test_treeattn_cuda_native_prepared_full_qk_accum_matches_python() -> None:
+    if not treeattn_cuda_native.has_native_kernels():
+        pytest.skip("treeattn_cuda native prepared fused qk kernel not enabled")
+
+    torch.manual_seed(0)
+    q = torch.randn((8, 1, 2, 16), device="cuda", dtype=torch.float32)
+    k = torch.randn((7, 1, 2, 16), device="cuda", dtype=torch.float32)
+    v = torch.randn((8, 1, 2, 16), device="cuda", dtype=torch.float32)
+    grad_output = torch.randn((8, 1, 2, 16), device="cuda", dtype=torch.float32)
+    _, _, packed_paths = _sample_paths_non_causal_streaming_python(
+        q,
+        k,
+        num_samples=4,
+        block_size=4,
+        max_logit=1e3,
+    )
+    sampled_indices, attn_weights = _prepare_non_causal_backward_python(
+        q,
+        k,
+        packed_paths,
+        block_size=4,
+        max_logit=1e3,
+    )
+
+    grad_q_native = torch.zeros_like(q)
+    grad_k_native = torch.zeros_like(k)
+    used_native = _accumulate_qk_non_causal_all_depths_prepared_inplace(
+        q,
+        k,
+        v,
+        grad_output,
+        sampled_indices,
+        attn_weights,
+        packed_paths,
+        max_logit=1e3,
+        grad_q_out=grad_q_native,
+        grad_k_out=grad_k_native,
+    )
+    assert used_native
+
+    gathered_values = _gather_tree_values(v, sampled_indices).to(torch.float32)
+    grad_attn = (grad_output.to(torch.float32).unsqueeze(-2) * gathered_values).sum(dim=-1)
+    grad_log_probs = attn_weights * (
+        grad_attn - (attn_weights * grad_attn).sum(dim=-1, keepdim=True)
+    )
+
+    grad_q_python = torch.zeros_like(q)
+    grad_k_python = torch.zeros_like(k)
+    node_idx = torch.zeros((8, 1, 2, 4), device="cuda", dtype=torch.int64)
+    log_n = (k.shape[0] + 1).bit_length() - 1
+    for depth in range(log_n):
+        bit = ((packed_paths[..., depth // 8] >> (depth % 8)) & 1).to(torch.int64)
+        branch_sign = torch.where(bit == 0, 1.0, -1.0).to(torch.float32)
+        gathered_keys = torch.gather(
+            k.permute(1, 2, 0, 3).contiguous().expand(8, 1, 2, 7, 16),
+            dim=-2,
+            index=node_idx.unsqueeze(-1).expand(8, 1, 2, 4, 16),
+        )
+        logits = (q.unsqueeze(-2) * gathered_keys).sum(dim=-1).clamp(min=-1e3, max=1e3)
+        grad_logit = branch_sign * torch.sigmoid(-branch_sign * logits) * grad_log_probs
+        grad_q_python = grad_q_python + (grad_logit.unsqueeze(-1) * gathered_keys).sum(dim=-2)
+        grad_k_updates = grad_logit.unsqueeze(-1) * q.unsqueeze(-2)
+        grad_k_python = grad_k_python + _scatter_tree_updates(7, node_idx, grad_k_updates)
+        if depth + 1 < log_n:
+            node_idx = 2 * node_idx + 1 + bit
+
+    torch.testing.assert_close(grad_q_native, grad_q_python)
+    torch.testing.assert_close(grad_k_native, grad_k_python)
 
 
 def test_treeattn_cuda_native_sampler_matches_python() -> None:

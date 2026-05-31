@@ -42,12 +42,9 @@ template <typename scalar_t, typename acc_t>
 __global__ void prepare_non_causal_backward_kernel(
     const scalar_t* __restrict__ q,
     const scalar_t* __restrict__ k,
-    const scalar_t* __restrict__ v,
-    const scalar_t* __restrict__ grad_output,
     const uint8_t* __restrict__ packed_paths,
     int32_t* __restrict__ sampled_indices,
     float* __restrict__ attn_weights,
-    float* __restrict__ grad_log_probs,
     int64_t k_len,
     int64_t batch,
     int64_t nheads,
@@ -77,7 +74,6 @@ __global__ void prepare_non_causal_backward_kernel(
   const int64_t q_offset = (((query_idx * batch) + batch_idx) * nheads + head_idx) * width;
 
   float log_prob = -INFINITY;
-  float grad_attn = 0.0f;
   int32_t leaf_idx = 0;
   if (active) {
     const int64_t sample_idx = lane;
@@ -108,12 +104,6 @@ __global__ void prepare_non_causal_backward_kernel(
     }
 
     leaf_idx = static_cast<int32_t>(node_idx - k_len);
-    const int64_t v_offset = (((static_cast<int64_t>(leaf_idx) * batch) + batch_idx) * nheads + head_idx) * width;
-    acc_t grad_attn_acc = static_cast<acc_t>(0);
-    for (int64_t d = 0; d < width; ++d) {
-      grad_attn_acc += static_cast<acc_t>(grad_output[q_offset + d]) * static_cast<acc_t>(v[v_offset + d]);
-    }
-    grad_attn = static_cast<float>(grad_attn_acc);
   }
 
   const float max_log_prob = warp_reduce_max(log_prob);
@@ -127,27 +117,19 @@ __global__ void prepare_non_causal_backward_kernel(
 
   if (active) {
     attn_weight /= sum_exp;
-  }
-
-  const float grad_center = warp_reduce_sum(attn_weight * grad_attn);
-
-  if (active) {
     const int64_t sample_offset = qbh_idx * num_samples + lane;
     sampled_indices[sample_offset] = leaf_idx;
     attn_weights[sample_offset] = attn_weight;
-    grad_log_probs[sample_offset] = attn_weight * (grad_attn - grad_center);
   }
 }
 
 }  // namespace
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor>
 prepare_non_causal_backward_cuda(
     const torch::Tensor& q,
     const torch::Tensor& k,
-    const torch::Tensor& v,
     const torch::Tensor& packed_paths,
-    const torch::Tensor& grad_output,
     double max_logit) {
   c10::cuda::CUDAGuard device_guard(q.device());
 
@@ -164,9 +146,6 @@ prepare_non_causal_backward_cuda(
       {num_queries, batch, nheads, num_samples},
       q.options().dtype(torch::kInt32));
   auto attn_weights = torch::empty(
-      {num_queries, batch, nheads, num_samples},
-      q.options().dtype(torch::kFloat32));
-  auto grad_log_probs = torch::empty(
       {num_queries, batch, nheads, num_samples},
       q.options().dtype(torch::kFloat32));
 
@@ -189,12 +168,9 @@ prepare_non_causal_backward_cuda(
             at::cuda::getDefaultCUDAStream()>>>(
             q.data_ptr<scalar_t>(),
             k.data_ptr<scalar_t>(),
-            v.data_ptr<scalar_t>(),
-            grad_output.data_ptr<scalar_t>(),
             packed_paths.data_ptr<uint8_t>(),
             sampled_indices.data_ptr<int32_t>(),
             attn_weights.data_ptr<float>(),
-            grad_log_probs.data_ptr<float>(),
             k_len,
             batch,
             nheads,
@@ -207,5 +183,5 @@ prepare_non_causal_backward_cuda(
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  return std::make_tuple(sampled_indices, attn_weights, grad_log_probs);
+  return std::make_tuple(sampled_indices, attn_weights);
 }
